@@ -89,6 +89,12 @@ static double tf_get_time_ms(void) {
 /* Use Metal for GPU acceleration when available */
 #ifdef USE_METAL
 #include "iris_metal.h"
+#include <pthread.h>
+#endif
+
+/* Use CUDA for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUDA
+#include "iris_cuda.h"
 #endif
 
 /* Enable BF16 pipeline debug logging when IRIS_BF16_DEBUG is set. */
@@ -1610,6 +1616,15 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
     }
 #endif
 
+#ifdef USE_CUDA
+    if (iris_cuda_available() &&
+        /* WSL2 check: cuBLAS JIT crashes on WSL. Disable attention CUDA path there. */
+        !getenv("WSL_DISTRO_NAME") &&
+        iris_cuda_attention(out, q, k, v, seq, seq, tf->num_heads, head_dim, scale)) {
+        return;
+    }
+#endif
+
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
     /* BLAS path: thread-parallel per-head attention.
@@ -1730,6 +1745,17 @@ static void joint_attention(float *img_out, float *txt_out,
         /* Transpose outputs back */
         transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
         transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    if (iris_cuda_available() &&
+        !getenv("WSL_DISTRO_NAME") &&
+        iris_cuda_attention(img_out, img_q, cat_k, cat_v,
+                            img_seq, total_seq, heads, head_dim, scale) &&
+        iris_cuda_attention(txt_out, txt_q, cat_k, cat_v,
+                            txt_seq, total_seq, heads, head_dim, scale)) {
         return;
     }
 #endif

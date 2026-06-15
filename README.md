@@ -19,8 +19,9 @@ Supported model families:
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
-# or: make blas    # Intel Mac / Linux with OpenBLAS
-# or: make generic # Pure C, no dependencies
+# or: make cuda     # NVIDIA GPU + cuBLAS (fastest on CUDA hardware)
+# or: make blas     # Intel Mac / Linux with OpenBLAS
+# or: make generic  # Pure C, no dependencies
 
 # Download a model (~16GB) - pick one:
 ./download_model.sh 4b                   # using curl
@@ -273,13 +274,15 @@ Choose a backend when building:
 make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
+make cuda       # NVIDIA GPU + cuBLAS (fastest on CUDA hardware)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with OpenBLAS: `make blas`
+- Linux with CUDA GPU: `make cuda`
+- Linux with OpenBLAS, no GPU: `make blas`
 - Linux without OpenBLAS: `make generic`
 
 For `make blas` on Linux, install OpenBLAS first:
@@ -289,6 +292,24 @@ sudo apt install libopenblas-dev
 
 # Fedora
 sudo dnf install openblas-devel
+```
+
+For `make cuda` on Linux, install the CUDA toolkit and OpenBLAS:
+```bash
+# Ubuntu/Debian
+sudo apt install libopenblas-dev nvidia-cuda-toolkit libcublas-dev
+
+# Fedora
+sudo dnf install openblas-devel cuda-toolkit
+```
+
+On WSL2 with the NVIDIA driver on Windows, install the CUDA toolkit inside WSL:
+```bash
+sudo apt install nvidia-cuda-toolkit libcublas-dev-13-1 cuda-cudart-dev-13-1
+```
+Then set `LD_LIBRARY_PATH` at runtime:
+```bash
+export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib
 ```
 
 Other targets:
@@ -316,7 +337,26 @@ The tests compare generated images against reference images in `test_vectors/`. 
 | img2img | 256x256 | 4 | Validates image-to-image transformation |
 | Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
 
-You can also run the test script directly for more options:
+### CPU vs CUDA Comparison Script
+
+Build both backends and compare outputs with one command:
+
+```bash
+./scripts/build_test.sh           # Full test (includes 256x256 benchmark)
+./scripts/build_test.sh --quick   # Quick test (64x64 only)
+```
+
+This script:
+1. Builds the generic (CPU) backend
+2. Runs a 64x64 smoke test on CPU
+3. Builds the CUDA backend
+4. Runs a 64x64 smoke test on CUDA
+5. Compares CPU and CUDA output pixel-by-pixel (same seed)
+6. Benchmarks CUDA at 256x256 (unless `--quick`)
+
+Prerequisites: `python3-numpy`, `python3-pil`, and `imagemagick` (for `identify`).
+
+You can also run the Python test runner directly:
 ```bash
 python3 run_test.py --help
 python3 run_test.py --quick
@@ -382,6 +422,17 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
+### CUDA Benchmarks (v1 backend)
+
+The CUDA backend is a first implementation (v1) — linear layers run on GPU via cuBLAS, while attention and text encoding run on CPU (BLAS). Full GPU acceleration for these paths is work in progress. Timings on **NVIDIA RTX 6000 Ada Generation** (48 GB VRAM):
+
+| Size | Steps | Backend | Time |
+|------|-------|---------|------|
+| 64x64 | 2 | CUDA (v1) | ~60s |
+| 256x256 | 4 | CUDA (v1) | ~100s |
+
+On WSL2, the CUDA attention path is disabled due to a driver JIT bug; it falls back to BLAS automatically. On native Linux the v1 path is the same (linear layers on GPU, attention on CPU).
+
 ### Community Benchmarks
 
 The following timings for 512x512 generation (Flux distilled model, 4 steps) were reported by users. They can serve as a rough indication of the performance you could expect, but results vary widely depending on the hardware, Metal availability (the code is heavily optimized for Apple Silicon via MPS), and whether BLAS acceleration is used on CPU.
@@ -394,6 +445,7 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 | MacBook Pro M1 Max | MPS | 39.9s |
 | Apple M1 Pro | MPS | 42.4s |
 | AMD Ryzen 7800X3D | BLAS | 47.8s |
+| RTX 6000 Ada (WSL2) | CUDA+BLAS | ~tbd |
 | Intel i5-1135G7 | BLAS | 218s |
 
 ## Resolution Limits

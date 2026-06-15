@@ -36,6 +36,10 @@
 #include "iris_metal.h"
 #endif
 
+#ifdef USE_CUDA
+#include "iris_cuda.h"
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -265,6 +269,9 @@ int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     iris_metal_init();
 #endif
+#ifdef USE_CUDA
+    iris_cuda_init();
+#endif
 
     /* Command line options */
     static struct option long_options[] = {
@@ -389,6 +396,13 @@ int main(int argc, char *argv[]) {
             size_t len = sizeof(cpu_brand);
             sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
             fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
+        }
+#elif defined(USE_CUDA)
+        if (iris_cuda_available()) {
+            const char *dev = iris_cuda_device_name();
+            fprintf(stderr, "CUDA: cuBLAS | %s\n", dev ? dev : "unknown GPU");
+        } else {
+            fprintf(stderr, "CUDA: cuBLAS backend (no GPU available)\n");
         }
 #elif defined(USE_BLAS)
 #ifdef __APPLE__
@@ -730,6 +744,9 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_METAL
     iris_metal_cleanup();
+#endif
+#ifdef USE_CUDA
+    iris_cuda_cleanup();
 #endif
 
     return 0;

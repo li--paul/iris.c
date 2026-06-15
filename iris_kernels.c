@@ -25,6 +25,11 @@
 #endif
 #endif
 
+/* Use CUDA for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUDA
+#include "iris_cuda.h"
+#endif
+
 /* Minimum matrix size to use GPU (smaller matrices are faster on CPU) */
 #define MIN_GPU_ELEMENTS (512 * 512)
 
@@ -158,6 +163,14 @@ void iris_matmul(float *C, const float *A, const float *B,
     }
 #endif
 
+#ifdef USE_CUDA
+    size_t nelements = (size_t)M * N;
+    if (iris_cuda_available() && nelements >= MIN_GPU_ELEMENTS) {
+        iris_cuda_sgemm(0, 0, M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+        return;
+    }
+#endif
+
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 M, N, K,
@@ -191,6 +204,14 @@ void iris_matmul_t(float *C, const float *A, const float *B,
                          B, K,
                          0.0f,
                          C, N);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t nelements = (size_t)M * N;
+    if (iris_cuda_available() && nelements >= MIN_GPU_ELEMENTS) {
+        iris_cuda_sgemm(0, 1, M, N, K, 1.0f, A, K, B, K, 0.0f, C, N);
         return;
     }
 #endif
@@ -243,6 +264,14 @@ void iris_linear(float *y, const float *x, const float *W, const float *b,
                 }
             }
         }
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t nelements = (size_t)seq_len * out_dim;
+    if (iris_cuda_available() && nelements >= MIN_GPU_ELEMENTS) {
+        iris_cuda_linear(y, x, W, b, seq_len, in_dim, out_dim);
         return;
     }
 #endif
@@ -356,6 +385,17 @@ void iris_conv2d(float *out, const float *in, const float *weight, const float *
                  int kH, int kW, int stride, int padding) {
     int outH = (H + 2 * padding - kH) / stride + 1;
     int outW = (W + 2 * padding - kW) / stride + 1;
+
+#ifdef USE_CUDA
+    {
+        size_t ce = (size_t)in_ch * kH * kW * outH * outW;
+        if (iris_cuda_available() && ce >= MIN_GPU_ELEMENTS) {
+            iris_cuda_conv2d(out, in, weight, bias,
+                             batch, in_ch, out_ch, H, W, kH, kW, stride, padding);
+            return;
+        }
+    }
+#endif
 
 #ifdef USE_BLAS
     /* im2col + BLAS optimization with tiling for large convolutions */
@@ -815,6 +855,13 @@ static void flash_attention_head_tiled(float *out,
             float *out_tile = out + q_start * head_dim;
 
             /* Compute tile scores: Q_tile @ K_tile^T * scale */
+#ifdef USE_CUDA
+            if (iris_cuda_available() && (size_t)q_len * k_len >= MIN_GPU_ELEMENTS) {
+                iris_cuda_sgemm(0, 1, q_len, k_len, head_dim,
+                                scale, Q_tile, head_dim, K_tile, head_dim,
+                                0.0f, tile_scores, k_tile_size);
+            } else
+#endif
 #ifdef USE_BLAS
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         q_len, k_len, head_dim,

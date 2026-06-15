@@ -31,6 +31,11 @@
 #include "iris_metal.h"
 #endif
 
+/* Use CUDA for GPU acceleration on NVIDIA GPUs */
+#ifdef USE_CUDA
+#include "iris_cuda.h"
+#endif
+
 /* Minimum matrix size for GPU acceleration.
  * Using 10M threshold keeps text encoder on CPU (Accelerate BLAS), which is
  * faster and avoids GPU memory pressure on 16GB systems. Text encoder weights
@@ -166,6 +171,16 @@ static void qwen3_linear(float *y, const float *x, const float *W,
                                 W, in_dim,
                                 0.0f,
                                 y, out_dim);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (iris_cuda_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
+        iris_cuda_sgemm_cached(0, 1, seq_len, out_dim, in_dim,
+                               1.0f, x, in_dim, W, in_dim,
+                               0.0f, y, out_dim);
         return;
     }
 #endif

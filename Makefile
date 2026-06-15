@@ -22,7 +22,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas cuda mps
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -34,6 +34,7 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+	@echo "  make cuda     - NVIDIA GPU with cuBLAS (fastest on CUDA hardware)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -47,7 +48,7 @@ endif
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
-	@echo "Example: make mps && ./iris -d flux-klein-4b -p \"a cat\" -o cat.png"
+	@echo "Example: make cuda && ./iris -d flux-klein-4b -p \"a cat\" -o cat.png"
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -110,6 +111,23 @@ mps:
 endif
 
 # =============================================================================
+# Backend: cuda (NVIDIA GPU with cuBLAS)
+# =============================================================================
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -I/usr/local/cuda/targets/x86_64-linux/include
+CUDA_LDFLAGS = -L/usr/local/cuda/targets/x86_64-linux/lib -lcublas -lcudart -lopenblas -lm
+
+cuda: CFLAGS = $(CUDA_CFLAGS)
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend (cuBLAS GPU acceleration)"
+
+cuda-build: $(OBJS) $(CLI_OBJS) iris_cuda.o main.o
+	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
+iris_cuda.o: iris_cuda.c iris_cuda.h
+	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) $(CLI_OBJS) main.o
@@ -155,7 +173,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 iris_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o iris_cuda.o main.o $(TARGET) $(LIB)
 	rm -f iris_shaders_source.h
 
 info:
@@ -164,6 +182,7 @@ info:
 	@echo ""
 	@echo "Available backends for this platform:"
 	@echo "  generic - Pure C (always available)"
+	@echo "  cuda    - NVIDIA GPU cuBLAS (requires CUDA toolkit)"
 ifeq ($(UNAME_S),Darwin)
 	@echo "  blas    - Apple Accelerate"
 ifeq ($(UNAME_M),arm64)
