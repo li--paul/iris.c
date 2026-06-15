@@ -21,7 +21,15 @@ Supported model families:
 make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
+```
 
+**Windows (MSVC + oneMKL):**
+```powershell
+cmake -B build -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64
+cmake --build build --config Release
+```
+
+```bash
 # Download a model (~16GB) - pick one:
 ./download_model.sh 4b                   # using curl
 # or: pip install huggingface_hub && python download_model.py 4b
@@ -267,6 +275,8 @@ The following metadata fields are stored:
 
 ## Building
 
+### macOS / Linux (Makefile)
+
 Choose a backend when building:
 
 ```bash
@@ -297,18 +307,51 @@ make clean      # Clean build artifacts
 make info       # Show available backends for this platform
 ```
 
+### Windows (CMake + MSVC)
+
+Requires [Visual Studio 2022](https://visualstudio.microsoft.com/) with C++ tools and [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) (optional).
+
+```powershell
+# BLAS (oneMKL accelerated, requires LP64 interface)
+cmake -B build -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64
+cmake --build build --config Release
+
+# Pure C (no acceleration, very slow)
+cmake -B build_generic -DUSE_BLAS=OFF
+cmake --build build_generic --config Release
+```
+
+**MKL interface note:** MKL defaults to **ILP64** (64-bit integers), but iris passes 32-bit `int`. Use `intel_lp64` to match the calling convention; otherwise cblas_sgemm calls interpret dimensions as 64-bit and crash with `STATUS_FLOAT_MULTIPLE_FAULTS (0xC06D007E)`.
+
+**Runtime DLL PATH:** MKL's threading layer (`mkl_intel_thread.2.dll`) depends on Intel OpenMP (`libiomp5md.dll` in `compiler/<version>/bin/`). Add both MKL and compiler bin directories to PATH:
+
+```powershell
+$env:PATH = "C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin;C:\Program Files (x86)\Intel\oneAPI\compiler\2025.0\bin;" + $env:PATH
+```
+
+Without these DLLs, MKL silently falls back to single-threaded sequential execution (equivalent to pure C speed).
+
 ## Testing
 
-Run the test suite to verify your build produces correct output:
+### macOS / Linux
 
 ```bash
 make test        # Run all tests
 make test-quick  # Run only the quick 64x64 test
 ```
 
+### Windows
+
+```powershell
+powershell -File windows_test.ps1
+```
+
+The test script builds both BLAS (MKL) and GENERIC (pure C) backends, runs a quick 64×64 1-step sanity check, a full 256×256 4-step generation, and compares output hashes between the two backends.
+
+### Test Cases
+
 The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is within tolerance (to allow for minor floating-point variations across platforms).
 
-**Test cases:**
 | Test | Size | Steps | Purpose |
 |------|------|-------|---------|
 | Quick | 64x64 | 2 | Fast txt2img sanity check |
@@ -395,6 +438,7 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 | Apple M1 Pro | MPS | 42.4s |
 | AMD Ryzen 7800X3D | BLAS | 47.8s |
 | Intel i5-1135G7 | BLAS | 218s |
+| Intel i9-13900K (Win/MSVC) | MKL (LP64) | ~70s (256x256, 4 steps) |
 
 ## Resolution Limits
 
@@ -573,6 +617,30 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 - **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 
 - **Generic (pure C):** Same tradeoffs as BLAS, but slower overall.
+
+## Windows Compilation Issues
+
+MSVC-specific fixes applied to the codebase:
+
+| Issue | Files | Fix |
+|-------|-------|-----|
+| VLA (variable-length arrays) | `iris_transformer_flux.c`, `iris_transformer_zimage.c` | Replaced with `malloc`/`free` |
+| `sysconf(_SC_NPROCESSORS_ONLN)` | `iris_transformer_flux.c` | Replaced with `GetSystemInfo` |
+| POSIX `isatty`, `strcasecmp`, `unlink`, `strdup` | Various | `#define` wrappers in `iris_platform.h` |
+| `STDIN_FILENO`, `EAGAIN`/`EWOULDBLOCK` | `iris_platform.h` | Win32 constant definitions |
+| `munmap` | `iris_safetensors.c` | `iris_munmap()` wrapper (`UnmapViewOfFile` on Win32) |
+| `#include <cblas.h>` | 4 source files | Conditional include: `#ifdef USE_MKL → <mkl_cblas.h>` |
+| `mode_t`/`umask` | `linenoise.c` | `#ifndef _WIN32` guard |
+| Debug `/RTC1` vs `/O2` conflict | `CMakeLists.txt` | Generator expression: `$<$<NOT:$<CONFIG:Debug>>:/O2>` |
+| oneMKL headers | `CMakeLists.txt` | `target_include_directories(iris PRIVATE ${MKL_INCLUDE})` |
+
+## Known Windows Limitations
+
+- **Distilled models need full 4 steps** — `--steps 2` or 64×64 low resolution produces noise-like output (space correlation h_adj_diff ~19 vs ~8 at 256×256).
+- **GENERIC_BUILD (pure C)** — Correct output verified by hash comparison with BLAS, but Qwen3 encoding alone takes >10 minutes. Not practical for real use.
+- **BLAS multi-threading** — Single-thread vs multi-thread MKL produce different outputs due to floating-point order of operations. Multi-thread is deterministic across runs.
+- **mmap / no-mmap** — Both modes produce identical output hashes for the same parameters.
+- **Interactive CLI** — Stubbed on Windows (simple stdin input, no raw terminal mode).
 
 ## C Library API
 
