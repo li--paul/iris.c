@@ -1,8 +1,10 @@
 # Object files
 *.o
+*.obj
 
 # Compiled binaries
 flux
+*.exe
 
 # Model weights (large files)
 flux-klein-*/
@@ -22,8 +24,37 @@ documents/
 *.swo
 *~
 .DS_Store
+*.suo
+*.user
+*.vs/
 
 # Build artifacts
 *.a
 *.so
 *.dylib
+*.lib
+*.dll
+*.exp
+*.pdb
+*.ilk
+
+# CMake build directories
+build/
+build_generic/
+build-test/
+
+# Generated test images (root level only, keep images/ and test_vectors/)
+/test_*.png
+/test_*.jpg
+
+# Python cache / virtual environments
+__pycache__/
+*.pyc
+*.pyo
+flux_env/
+flux2/
+.venv/
+venv/
+
+# Debug / temp
+/tmp/

@@ -11,10 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <time.h>
-#include <unistd.h>
-#include <sys/stat.h>
 #include <errno.h>
+#include "iris_platform.h"
 
 #include "iris.h"
 #include "iris_kernels.h"
@@ -228,8 +226,9 @@ static char *extract_size_from_prompt(const char *prompt, int *w, int *h) {
  * ====================================================================== */
 
 static int create_tmpdir(void) {
-    snprintf(state.tmpdir, sizeof(state.tmpdir), "/tmp/iris-XXXXXX");
-    if (mkdtemp(state.tmpdir) == NULL) {
+    snprintf(state.tmpdir, sizeof(state.tmpdir), "%s/iris-XXXXXX",
+             iris_get_temp_dir());
+    if (iris_mkdtemp(state.tmpdir) != 0) {
         fprintf(stderr, "Error: Cannot create temp directory: %s\n",
                 strerror(errno));
         return -1;
@@ -382,8 +381,8 @@ static int generate_image(const char *prompt, const char *ref_image,
     }
 
     /* Start timing */
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    iris_timespec_t start_time, end_time;
+    iris_clock_monotonic(&start_time);
 
     /* Set up progress callbacks */
     cli_prepare_next_generation();
@@ -460,7 +459,7 @@ static int generate_image(const char *prompt, const char *ref_image,
     if (ref) iris_image_free(ref);
 
     /* End timing */
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    iris_clock_monotonic(&end_time);
     double elapsed = (end_time.tv_sec - start_time.tv_sec) +
                      (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
@@ -509,8 +508,8 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     printf("Seed: %lld\n", (long long)actual_seed);
 
     /* Start timing */
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    iris_timespec_t start_time, end_time;
+    iris_clock_monotonic(&start_time);
 
     /* Load reference images */
     iris_image **refs = (iris_image **)malloc(num_refs * sizeof(iris_image *));
@@ -554,7 +553,7 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
     iris_set_step_image_callback(state.ctx, NULL);
 
     /* End timing */
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    iris_clock_monotonic(&end_time);
     double elapsed = (end_time.tv_sec - start_time.tv_sec) +
                      (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 

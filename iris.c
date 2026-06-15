@@ -9,11 +9,11 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_qwen3.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/stat.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -228,8 +228,7 @@ static void set_error(const char *msg) {
  * ======================================================================== */
 
 static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
+    return iris_path_exists(path) ? 1 : 0;
 }
 
 /* Main model loading entry point. Parses model_index.json to auto-detect
@@ -1701,9 +1700,12 @@ iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params) {
     }
 
     /* Load Python's noise */
-    FILE *f_noise = fopen("/tmp/py_noise.bin", "rb");
+    char py_path[256];
+    snprintf(py_path, sizeof(py_path), "%s/py_noise.bin", iris_get_temp_dir());
+    FILE *f_noise = fopen(py_path, "rb");
     if (!f_noise) {
-        set_error("Cannot open /tmp/py_noise.bin");
+        set_error("Cannot open py_noise.bin");
+
         return NULL;
     }
     fseek(f_noise, 0, SEEK_END);
@@ -1715,10 +1717,11 @@ iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params) {
     fprintf(stderr, "[DEBUG] Loaded noise: %d floats\n", noise_size);
 
     /* Load Python's ref_latent */
-    FILE *f_ref = fopen("/tmp/py_ref_latent.bin", "rb");
+    snprintf(py_path, sizeof(py_path), "%s/py_ref_latent.bin", iris_get_temp_dir());
+    FILE *f_ref = fopen(py_path, "rb");
     if (!f_ref) {
-        free(noise);
-        set_error("Cannot open /tmp/py_ref_latent.bin");
+        set_error("Cannot open py_ref_latent.bin");
+
         return NULL;
     }
     fseek(f_ref, 0, SEEK_END);
@@ -1730,11 +1733,12 @@ iris_image *iris_img2img_debug_py(iris_ctx *ctx, const iris_params *params) {
     fprintf(stderr, "[DEBUG] Loaded ref_latent: %d floats\n", ref_size);
 
     /* Load Python's text_emb */
-    FILE *f_txt = fopen("/tmp/py_text_emb.bin", "rb");
+    snprintf(py_path, sizeof(py_path), "%s/py_text_emb.bin", iris_get_temp_dir());
+    FILE *f_txt = fopen(py_path, "rb");
     if (!f_txt) {
         free(noise);
         free(ref_latent);
-        set_error("Cannot open /tmp/py_text_emb.bin");
+        set_error("Cannot open py_text_emb.bin");
         return NULL;
     }
     fseek(f_txt, 0, SEEK_END);

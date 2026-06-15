@@ -21,7 +21,11 @@
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #else
+#if defined(USE_MKL)
+#include <mkl_cblas.h>
+#else
 #include <cblas.h>
+#endif
 #endif
 #endif
 

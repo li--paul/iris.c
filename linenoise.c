@@ -103,20 +103,25 @@
  *
  */
 
-#include <termios.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
-#include <stdlib.h>
 #include <ctype.h>
+#include <stdint.h>
+#include "iris_platform.h"
+#include "linenoise.h"
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#endif
+
+#ifndef _WIN32
+#include <termios.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <unistd.h>
-#include <stdint.h>
-#include "linenoise.h"
+#endif
 
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE 4096
@@ -128,7 +133,9 @@ static char *linenoiseNoTTY(void);
 static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseCompletions *lc, int flags);
 static void refreshLineWithFlags(struct linenoiseState *l, int flags);
 
+#ifndef _WIN32
 static struct termios orig_termios; /* In order to restore at exit.*/
+#endif
 static int maskmode = 0; /* Show "***" instead of input. For passwords. */
 static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int mlmode = 0;  /* Multi line mode. Default is single line. */
@@ -526,6 +533,7 @@ static int isUnsupportedTerm(void) {
     return 0;
 }
 
+#ifndef _WIN32
 /* Raw mode: 1960 magic shit. */
 static int enableRawMode(int fd) {
     struct termios raw;
@@ -579,6 +587,7 @@ static void disableRawMode(int fd) {
     if (rawmode && tcsetattr(fd,TCSAFLUSH,&orig_termios) != -1)
         rawmode = 0;
 }
+#endif /* _WIN32 */
 
 /* Use the ESC [6n escape sequence to query the horizontal cursor position
  * and return it. On error -1 is returned, on success the position of the
@@ -608,6 +617,7 @@ static int getCursorPosition(int ifd, int ofd) {
 /* Try to get the number of columns in the current terminal, or assume 80
  * if it fails. */
 static int getColumns(int ifd, int ofd) {
+#ifndef _WIN32
     struct winsize ws;
 
     /* Test mode: use LINENOISE_COLS env var for fixed width. */
@@ -642,13 +652,21 @@ static int getColumns(int ifd, int ofd) {
 
 failed:
     return 80;
+#else
+    (void)ifd; (void)ofd;
+    return 80;
+#endif
 }
 
 /* Clear the screen. Used to handle ctrl+l */
 void linenoiseClearScreen(void) {
+#ifndef _WIN32
     if (write(STDOUT_FILENO,"\x1b[H\x1b[2J",7) <= 0) {
         /* nothing to do, just to avoid warning. */
     }
+#else
+    system("cls");
+#endif
 }
 
 /* Beep, used for completion when there is nothing to complete or when all
@@ -1255,6 +1273,7 @@ void linenoiseEditDeletePrevWord(struct linenoiseState *l) {
  * fails. If stdin_fd or stdout_fd are set to -1, the default is to use
  * STDIN_FILENO and STDOUT_FILENO.
  */
+#ifndef _WIN32
 int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, char *buf, size_t buflen, const char *prompt) {
     /* Populate the linenoise state that we pass to functions implementing
      * specific editing functionalities. */
@@ -1292,6 +1311,7 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     if (write(l->ofd,prompt,l->plen) == -1) return -1;
     return 0;
 }
+#endif /* _WIN32 */
 
 char *linenoiseEditMore = "If you see this, you are misusing the API: when linenoiseEditFeed() is called, if it returns linenoiseEditMore the user is yet editing the line. See the README file for more information.";
 
@@ -1313,6 +1333,7 @@ char *linenoiseEditMore = "If you see this, you are misusing the API: when linen
  *
  * Some other errno: I/O error.
  */
+#ifndef _WIN32
 char *linenoiseEditFeed(struct linenoiseState *l) {
     /* Not a TTY, pass control to line reading without character
      * count limits. */
@@ -1498,17 +1519,21 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
     }
     return linenoiseEditMore;
 }
+#endif /* _WIN32 */
 
 /* This is part of the multiplexed linenoise API. See linenoiseEditStart()
  * for more information. This function is called when linenoiseEditFeed()
  * returns something different than NULL. At this point the user input
  * is in the buffer, and we can restore the terminal in normal mode. */
+#ifndef _WIN32
 void linenoiseEditStop(struct linenoiseState *l) {
     if (!isatty(l->ifd) && !getenv("LINENOISE_ASSUME_TTY")) return;
     disableRawMode(l->ifd);
     printf("\n");
 }
+#endif /* _WIN32 */
 
+#ifndef _WIN32
 /* This just implements a blocking loop for the multiplexed API.
  * In many applications that are not event-drivern, we can just call
  * the blocking linenoise API, wait for the user to complete the editing
@@ -1529,10 +1554,12 @@ static char *linenoiseBlockingEdit(int stdin_fd, int stdout_fd, char *buf, size_
     linenoiseEditStop(&l);
     return res;
 }
+#endif /* _WIN32 */
 
 /* This special mode is used by linenoise in order to print scan codes
  * on screen for debugging / development purposes. It is implemented
  * by the linenoise_example program using the --keycodes option. */
+#ifndef _WIN32
 void linenoisePrintKeyCodes(void) {
     char quit[4];
 
@@ -1557,6 +1584,7 @@ void linenoisePrintKeyCodes(void) {
     }
     disableRawMode(STDIN_FILENO);
 }
+#endif
 
 /* This function is called when linenoise() is called with the standard
  * input file descriptor not attached to a TTY. So for example when the
@@ -1600,6 +1628,16 @@ static char *linenoiseNoTTY(void) {
  * editing function or uses dummy fgets() so that you will be able to type
  * something even in the most desperate of the conditions. */
 char *linenoise(const char *prompt) {
+#ifdef _WIN32
+    /* Windows: simple stdin-based input (no raw terminal mode) */
+    static char buf[LINENOISE_MAX_LINE];
+    printf("%s", prompt);
+    fflush(stdout);
+    if (fgets(buf, sizeof(buf), stdin) == NULL) return NULL;
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
+    return strdup(buf);
+#else
     char buf[LINENOISE_MAX_LINE];
 
     if (!isatty(STDIN_FILENO) && !getenv("LINENOISE_ASSUME_TTY")) {
@@ -1622,6 +1660,7 @@ char *linenoise(const char *prompt) {
         char *retval = linenoiseBlockingEdit(STDIN_FILENO,STDOUT_FILENO,buf,LINENOISE_MAX_LINE,prompt);
         return retval;
     }
+#endif
 }
 
 /* This is just a wrapper the user may want to call in order to make sure
@@ -1648,10 +1687,12 @@ static void freeHistory(void) {
 }
 
 /* At exit we'll try to fix the terminal to the initial conditions. */
+#ifndef _WIN32
 static void linenoiseAtExit(void) {
     disableRawMode(STDIN_FILENO);
     freeHistory();
 }
+#endif
 
 /* This is the API call to add a new entry in the linenoise history.
  * It uses a fixed array of char pointers that are shifted (memmoved)
@@ -1724,14 +1765,20 @@ int linenoiseHistorySetMaxLen(int len) {
 /* Save the history in the specified file. On success 0 is returned
  * otherwise -1 is returned. */
 int linenoiseHistorySave(const char *filename) {
-    mode_t old_umask = umask(S_IXUSR|S_IRWXG|S_IRWXO);
     FILE *fp;
     int j;
+#ifndef _WIN32
+    mode_t old_umask = umask(S_IXUSR|S_IRWXG|S_IRWXO);
+#endif
 
     fp = fopen(filename,"w");
+#ifndef _WIN32
     umask(old_umask);
+#endif
     if (fp == NULL) return -1;
+#ifndef _WIN32
     fchmod(fileno(fp),S_IRUSR|S_IWUSR);
+#endif
     for (j = 0; j < history_len; j++)
         fprintf(fp,"%s\n",history[j]);
     fclose(fp);

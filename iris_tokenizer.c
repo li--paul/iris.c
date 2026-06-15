@@ -111,7 +111,7 @@ static int utf8_char_len(unsigned char c) {
 }
 
 /* Decode UTF-8 character to codepoint - reserved for QWEN3 text encoder */
-__attribute__((unused))
+IRIS_UNUSED
 static int utf8_decode(const char *s, int *len) {
     unsigned char c = (unsigned char)s[0];
     if ((c & 0x80) == 0) {

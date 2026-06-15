@@ -10,10 +10,10 @@
  */
 
 #include "terminals.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 /* ======================================================================
  * Zoom Setting
@@ -303,13 +303,19 @@ int iterm2_display_image(const iris_image *img) {
     if (!img || !img->data) return -1;
 
     /* Create temp file for PNG */
-    char tmppath[] = "/tmp/iris_iterm_XXXXXX.png";
-    int fd = mkstemps(tmppath, 4);
+    char tmppath[256];
+    snprintf(tmppath, sizeof(tmppath), "%s/iris_iterm_XXXXXX.png",
+             iris_get_temp_dir());
+    int fd = iris_mkstemps(tmppath, 4);
     if (fd < 0) {
         fprintf(stderr, "iterm2: cannot create temp file\n");
         return -1;
     }
+#ifdef _WIN32
+    /* iris_mkstemps already created the file, no fd to close */
+#else
     close(fd);
+#endif
 
     /* Save image as PNG */
     if (iris_image_save(img, tmppath) != 0) {
@@ -321,7 +327,7 @@ int iterm2_display_image(const iris_image *img) {
     int result = iterm2_display_png(tmppath);
 
     /* Clean up */
-    unlink(tmppath);
+    iris_unlink(tmppath);
     return result;
 }
 

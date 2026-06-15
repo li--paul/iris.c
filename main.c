@@ -24,13 +24,15 @@
 #include "iris_kernels.h"
 #include "iris_cli.h"
 #include "terminals.h"
+#include "iris_platform.h"
 #include <stdio.h>
+#ifdef _WIN32
+#include <float.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
-#include <getopt.h>
 #include <time.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include <math.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -40,12 +42,14 @@
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
+#ifdef __linux__
 /* OpenBLAS introspection functions */
 extern int openblas_get_num_threads(void);
 extern int openblas_get_num_procs(void);
 extern char *openblas_get_corename(void);
 extern char *openblas_get_config(void);
 extern void openblas_set_num_threads(int num_threads);
+#endif
 #endif
 #endif
 
@@ -111,7 +115,7 @@ static void cli_substep_callback(iris_substep_type_t type, int index, int total)
 }
 
 /* Track phase timing (wall-clock) */
-static struct timeval cli_phase_start_tv;
+static iris_timeval_t cli_phase_start_tv;
 static const char *cli_current_phase = NULL;
 
 /* Called at phase boundaries (encoding text, decoding image, etc.) */
@@ -127,7 +131,7 @@ static void cli_phase_callback(const char *phase, int done) {
 
         /* Phase starting */
         cli_current_phase = phase;
-        gettimeofday(&cli_phase_start_tv, NULL);
+        iris_gettimeofday(&cli_phase_start_tv);
 
         /* Capitalize first letter for display */
         char display[64];
@@ -141,10 +145,10 @@ static void cli_phase_callback(const char *phase, int done) {
         fflush(stderr);
     } else {
         /* Phase finished */
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        double elapsed = (now.tv_sec - cli_phase_start_tv.tv_sec) +
-                         (now.tv_usec - cli_phase_start_tv.tv_usec) / 1000000.0;
+        iris_timeval_t now;
+        iris_gettimeofday(&now);
+        double elapsed = (now.sec - cli_phase_start_tv.sec) +
+                         (now.usec - cli_phase_start_tv.usec) / 1000000.0;
         fprintf(stderr, " done (%.1fs)\n", elapsed);
         cli_current_phase = NULL;
     }
@@ -182,17 +186,17 @@ static void cli_finish_progress(void) {
  * Timing Helper (wall-clock time)
  * ======================================================================== */
 
-static struct timeval timer_start_tv;
+static iris_timeval_t timer_start_tv;
 
 static void timer_begin(void) {
-    gettimeofday(&timer_start_tv, NULL);
+    iris_gettimeofday(&timer_start_tv);
 }
 
 static double timer_end(void) {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    return (now.tv_sec - timer_start_tv.tv_sec) +
-           (now.tv_usec - timer_start_tv.tv_usec) / 1000000.0;
+    iris_timeval_t now;
+    iris_gettimeofday(&now);
+    return (now.sec - timer_start_tv.sec) +
+           (now.usec - timer_start_tv.usec) / 1000000.0;
 }
 
 /* ========================================================================
@@ -262,12 +266,20 @@ static void print_usage(const char *prog) {
  * ======================================================================== */
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    /* Mask all x87 and SSE floating-point exceptions.
+     * oneMKL may unmask FP exceptions for performance; this ensures
+     * denormalized numbers from BLAS computation don't crash us. */
+    _clearfp();
+    _control87(_MCW_EM, _MCW_EM);
+    _controlfp(_MCW_EM, _MCW_EM);
+#endif
 #ifdef USE_METAL
     iris_metal_init();
 #endif
 
     /* Command line options */
-    static struct option long_options[] = {
+    static iris_option_t long_options[] = {
         {"dir",        required_argument, 0, 'd'},
         {"prompt",     required_argument, 0, 'p'},
         {"output",     required_argument, 0, 'o'},
@@ -329,26 +341,26 @@ int main(int argc, char *argv[]) {
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
-                              long_options, NULL)) != -1) {
+    while ((opt = iris_getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
+                                   long_options, NULL)) != -1) {
         switch (opt) {
-            case 'd': model_dir = optarg; break;
-            case 'p': prompt = optarg; break;
-            case 'o': output_path = optarg; break;
-            case 'W': params.width = atoi(optarg); width_set = 1; break;
-            case 'H': params.height = atoi(optarg); height_set = 1; break;
-            case 's': params.num_steps = atoi(optarg); steps_set = 1; break;
-            case 'g': params.guidance = atof(optarg); break;
-            case 'S': params.seed = atoll(optarg); break;
+            case 'd': model_dir = iris_optarg; break;
+            case 'p': prompt = iris_optarg; break;
+            case 'o': output_path = iris_optarg; break;
+            case 'W': params.width = atoi(iris_optarg); width_set = 1; break;
+            case 'H': params.height = atoi(iris_optarg); height_set = 1; break;
+            case 's': params.num_steps = atoi(iris_optarg); steps_set = 1; break;
+            case 'g': params.guidance = atof(iris_optarg); break;
+            case 'S': params.seed = atoll(iris_optarg); break;
             case 'i':
                 if (num_inputs < MAX_INPUT_IMAGES) {
-                    input_paths[num_inputs++] = optarg;
+                    input_paths[num_inputs++] = iris_optarg;
                 } else {
                     fprintf(stderr, "Warning: Maximum %d input images supported\n", MAX_INPUT_IMAGES);
                 }
                 break;
-            case 'e': embeddings_path = optarg; break;
-            case 'n': noise_path = optarg; break;
+            case 'e': embeddings_path = iris_optarg; break;
+            case 'n': noise_path = iris_optarg; break;
             case 'q': output_level = OUTPUT_QUIET; break;
             case 'v': output_level = OUTPUT_VERBOSE; iris_verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
@@ -359,16 +371,16 @@ int main(int argc, char *argv[]) {
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
-            case 'z': terminal_set_zoom(atoi(optarg)); break;
+            case 'z': terminal_set_zoom(atoi(iris_optarg)); break;
             case 'B': force_base = 1; break;
             case 'L': params.schedule = IRIS_SCHEDULE_LINEAR; break;
             case 256: params.schedule = IRIS_SCHEDULE_POWER; break;
-            case 257: params.power_alpha = atof(optarg); params.schedule = IRIS_SCHEDULE_POWER; break;
+            case 257: params.power_alpha = atof(iris_optarg); params.schedule = IRIS_SCHEDULE_POWER; break;
             case 260: params.schedule = IRIS_SCHEDULE_SIGMOID; break;
             case 261: params.schedule = IRIS_SCHEDULE_FLOWMATCH; break;
             case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
-            case 259: blas_threads = atoi(optarg); break;
+            case 259: blas_threads = atoi(iris_optarg); break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -376,7 +388,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* BLAS: apply thread setting regardless of quiet mode */
-#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__)
+#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__) && defined(__linux__)
     if (blas_threads > 0) openblas_set_num_threads(blas_threads);
 #endif
 
@@ -384,11 +396,15 @@ int main(int argc, char *argv[]) {
     if (output_level != OUTPUT_QUIET) {
 #ifdef USE_METAL
         if (iris_metal_available()) {
+#ifdef __APPLE__
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
             char cpu_brand[128] = "Apple Silicon";
             size_t len = sizeof(cpu_brand);
             sysctlbyname("machdep.cpu.brand_string", cpu_brand, &len, NULL, 0);
             fprintf(stderr, "MPS: Metal GPU | %s | %ld cores\n", cpu_brand, ncpu);
+#else
+            fprintf(stderr, "MPS: Metal GPU\n");
+#endif
         }
 #elif defined(USE_BLAS)
 #ifdef __APPLE__
@@ -401,12 +417,14 @@ int main(int argc, char *argv[]) {
             if (blas_threads > 0)
                 fprintf(stderr, "Warning: --blas-threads ignored (Accelerate manages threading automatically)\n");
         }
-#else
+#elif defined(__linux__)
         fprintf(stderr, "BLAS: OpenBLAS | %s | %d threads / %d procs\n",
                 openblas_get_corename(),
                 openblas_get_num_threads(),
                 openblas_get_num_procs());
         fprintf(stderr, "      %s\n", openblas_get_config());
+#else
+        fprintf(stderr, "BLAS: enabled\n");
 #endif
 #else
         fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
@@ -551,12 +569,12 @@ int main(int argc, char *argv[]) {
 
     /* Generate image */
     iris_image *output = NULL;
-    struct timeval total_start_tv;
-    gettimeofday(&total_start_tv, NULL);
+    iris_timeval_t total_start_tv;
+    iris_gettimeofday(&total_start_tv);
 
     if (debug_py) {
         /* ============== Debug mode: use Python inputs ============== */
-        LOG_NORMAL("Debug mode: loading Python inputs from /tmp/py_*.bin\n");
+        LOG_NORMAL("Debug mode: loading Python inputs from temp dir\n");
         output = iris_img2img_debug_py(ctx, &params);
     } else if (num_inputs > 0) {
         /* ============== Image-to-image mode (single or multi-reference) ============== */
@@ -690,10 +708,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    struct timeval total_end_tv;
-    gettimeofday(&total_end_tv, NULL);
-    double total_time = (total_end_tv.tv_sec - total_start_tv.tv_sec) +
-                        (total_end_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+    iris_timeval_t total_end_tv;
+    iris_gettimeofday(&total_end_tv);
+    double total_time = (total_end_tv.sec - total_start_tv.sec) +
+                        (total_end_tv.usec - total_start_tv.usec) / 1000000.0;
     LOG_VERBOSE("Generated in %.1fs total\n", total_time);
     LOG_VERBOSE("  Output: %dx%d, %d channels\n",
                 output->width, output->height, output->channels);
@@ -718,10 +736,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* Print total time (always, unless quiet) */
-    struct timeval final_tv;
-    gettimeofday(&final_tv, NULL);
-    double total_time_final = (final_tv.tv_sec - total_start_tv.tv_sec) +
-                              (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
+    iris_timeval_t final_tv;
+    iris_gettimeofday(&final_tv);
+    double total_time_final = (final_tv.sec - total_start_tv.sec) +
+                              (final_tv.usec - total_start_tv.usec) / 1000000.0;
     LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
 
     /* Cleanup */

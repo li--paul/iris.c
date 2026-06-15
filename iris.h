@@ -18,6 +18,7 @@
 #ifndef IRIS_H
 #define IRIS_H
 
+#include "iris_platform.h"
 #include <stddef.h>
 #include <stdint.h>
 

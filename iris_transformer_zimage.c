@@ -16,17 +16,21 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #else
+#if defined(USE_MKL)
+#include <mkl_cblas.h>
+#else
 #include <cblas.h>
+#endif
 #endif
 #endif
 
@@ -52,8 +56,8 @@ extern double iris_timing_zi_main_blocks;
 extern double iris_timing_zi_final;
 
 static inline double zi_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    iris_timespec_t ts;
+    iris_clock_monotonic(&ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
@@ -801,7 +805,8 @@ static void zi_block_forward(float *x, const zi_block_t *block,
 
     if (block->adaln_weight) {
         /* Modulated block: extract scale_msa, gate_msa, scale_mlp, gate_mlp */
-        float mod[4 * dim];
+        float *mod = (float*)malloc(sizeof(float) * 4 * dim);
+        if (!mod) return;
         iris_matmul_t(mod, t_emb, block->adaln_weight, 1, tf->adaln_dim, 4 * dim);
         for (int i = 0; i < 4 * dim; i++) mod[i] += block->adaln_bias[i];
 
@@ -846,7 +851,7 @@ static void zi_block_forward(float *x, const zi_block_t *block,
         for (int s = 0; s < seq; s++)
             for (int i = 0; i < dim; i++)
                 x[s * dim + i] += gate_mlp[i] * norm_out[s * dim + i];
-
+        free(mod);
     } else {
         /* Unmodulated block (context_refiner): no scale/gate */
 

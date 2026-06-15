@@ -3,13 +3,10 @@
  */
 
 #include "iris_safetensors.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
 /* Minimal JSON parser for safetensors header */
 
@@ -203,8 +200,20 @@ static int parse_header(safetensors_file_t *sf) {
 /* Open a safetensors file by memory-mapping it. Parses the JSON header to
  * build a tensor index (name -> offset/shape/dtype). Memory mapping lets the
  * OS page in tensor data on demand, avoiding upfront reads of multi-GB model
- * files -- only the weights actually used get loaded into RAM. */
+ * files -- only the weights actually used get loaded into RAM.
+ *
+ * On Windows, CreateFileMapping / MapViewOfFile is used instead of mmap.
+ * On macOS/Linux, the POSIX mmap path is used directly. */
 safetensors_file_t *safetensors_open(const char *path) {
+#ifdef _WIN32
+    iris_mmap_t mm;
+    if (iris_mmap_open(path, &mm) != 0) {
+        fprintf(stderr, "safetensors_open: failed to open %s\n", path);
+        return NULL;
+    }
+    void *data = mm.data;
+    size_t file_size = mm.size;
+#else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("safetensors_open: open failed");
@@ -232,6 +241,7 @@ safetensors_file_t *safetensors_open(const char *path) {
         perror("safetensors_open: mmap failed");
         return NULL;
     }
+#endif
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
@@ -239,13 +249,13 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (header_size > file_size - 8) {
         fprintf(stderr, "safetensors_open: invalid header size\n");
-        munmap(data, file_size);
+        iris_munmap(data, file_size);
         return NULL;
     }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) {
-        munmap(data, file_size);
+        iris_munmap(data, file_size);
         return NULL;
     }
 
@@ -294,7 +304,14 @@ safetensors_file_t *safetensors_open(const char *path) {
 
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
-    if (sf->data) munmap(sf->data, sf->file_size);
+#ifdef _WIN32
+    /* sf->data was allocated by MapViewOfFile; the iris_mmap_t is not stored,
+     * so we unmmap directly. The handle info is not preserved here, but
+     * UnmapViewOfFile only needs the base address. */
+    if (sf->data) UnmapViewOfFile(sf->data);
+#else
+    if (sf->data) iris_munmap(sf->data, sf->file_size);
+#endif
     free(sf->path);
     free(sf->header_json);
     free(sf);

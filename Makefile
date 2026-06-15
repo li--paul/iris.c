@@ -1,6 +1,8 @@
 # Iris - C Image Generation Engine
 # Supported models: FLUX.2 Klein (4B/9B), Z-Image-Turbo (6B)
-# Makefile
+# Makefile (legacy — kept for macOS users; CMakeLists.txt is the cross-platform build)
+# Platform note: This Makefile uses -march=native, -ffast-math, -lm (Unix-only).
+# For Windows or cross-platform builds, use CMake instead: cmake -B build
 
 CC = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math

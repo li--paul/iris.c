@@ -16,12 +16,11 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
-#include <sys/time.h>
 
 /* External timing counters from iris_sample.c */
 extern double iris_timing_transformer_total;
@@ -40,9 +39,9 @@ static double prof_single_proj_matmul = 0;
 static double prof_single_gated_add = 0;
 
 static double prof_get_time(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    iris_timeval_t tv;
+    iris_gettimeofday(&tv);
+    return tv.sec * 1000.0 + tv.usec / 1000.0;
 }
 
 void iris_print_blas_profile(void) {
@@ -70,9 +69,9 @@ void iris_reset_blas_profile(void) {
 
 /* Helper to get current time in ms (wall-clock) */
 static double tf_get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    iris_timeval_t tv;
+    iris_gettimeofday(&tv);
+    return tv.sec * 1000.0 + tv.usec / 1000.0;
 }
 
 /* Use BLAS for matrix operations when enabled via Makefile */
@@ -80,10 +79,12 @@ static double tf_get_time_ms(void) {
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #else
+#if defined(USE_MKL)
+#include <mkl_cblas.h>
+#else
 #include <cblas.h>
 #endif
-#include <pthread.h>
-#include <unistd.h>
+#endif
 #endif
 
 /* Use Metal for GPU acceleration when available */
@@ -1562,7 +1563,14 @@ static void *joint_attn_thread_worker(void *arg) {
 static int get_attn_num_threads(int heads) {
     static int cached = 0;
     if (cached) return cached;
-    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int ncpu;
+#ifdef _WIN32
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    ncpu = (int)sysinfo.dwNumberOfProcessors;
+#else
+    ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (ncpu < 2) { cached = 1; return 1; }
     if (ncpu > heads) ncpu = heads;
     /* Round down to divide heads evenly */
@@ -1643,9 +1651,10 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
                             0.0f, oh, hidden);
             }
         } else {
-            pthread_t threads[nthreads];
-            mha_thread_work_t work[nthreads];
-            int ok[nthreads];
+            iris_thread_t *threads = (iris_thread_t*)malloc(sizeof(iris_thread_t) * nthreads);
+            mha_thread_work_t *work = (mha_thread_work_t*)malloc(sizeof(mha_thread_work_t) * nthreads);
+            int *ok = (int*)malloc(sizeof(int) * nthreads);
+            if (!threads || !work || !ok) { free(threads); free(work); free(ok); return; }
             for (int t = 0; t < nthreads; t++) {
                 work[t] = (mha_thread_work_t){
                     .q = q, .k = k, .v = v,
@@ -1655,12 +1664,26 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
                     .head_start = t * heads_per_thread,
                     .head_end = (t + 1) * heads_per_thread,
                 };
+#ifdef _WIN32
+                threads[t] = CreateThread(NULL, 0,
+                    (LPTHREAD_START_ROUTINE)mha_thread_worker, &work[t], 0, NULL);
+                ok[t] = (threads[t] != NULL);
+#else
                 ok[t] = pthread_create(&threads[t], NULL, mha_thread_worker, &work[t]) == 0;
+#endif
                 if (!ok[t]) mha_thread_worker(&work[t]);
             }
             for (int t = 0; t < nthreads; t++) {
-                if (ok[t]) pthread_join(threads[t], NULL);
+                if (ok[t]) {
+#ifdef _WIN32
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+#else
+                    pthread_join(threads[t], NULL);
+#endif
+                }
             }
+            free(threads); free(work); free(ok);
         }
     }
 #else
@@ -1777,9 +1800,10 @@ static void joint_attention(float *img_out, float *txt_out,
                             0.0f, txt_oh, hidden);
             }
         } else {
-            pthread_t threads[nthreads];
-            joint_attn_thread_work_t work[nthreads];
-            int ok[nthreads];
+            iris_thread_t *threads = (iris_thread_t*)malloc(sizeof(iris_thread_t) * nthreads);
+            joint_attn_thread_work_t *work = (joint_attn_thread_work_t*)malloc(sizeof(joint_attn_thread_work_t) * nthreads);
+            int *ok = (int*)malloc(sizeof(int) * nthreads);
+            if (!threads || !work || !ok) { free(threads); free(work); free(ok); return; }
             for (int t = 0; t < nthreads; t++) {
                 work[t] = (joint_attn_thread_work_t){
                     .img_q = img_q, .txt_q = txt_q,
@@ -1793,12 +1817,26 @@ static void joint_attention(float *img_out, float *txt_out,
                     .head_start = t * heads_per_thread,
                     .head_end = (t + 1) * heads_per_thread,
                 };
+#ifdef _WIN32
+                threads[t] = CreateThread(NULL, 0,
+                    (LPTHREAD_START_ROUTINE)joint_attn_thread_worker, &work[t], 0, NULL);
+                ok[t] = (threads[t] != NULL);
+#else
                 ok[t] = pthread_create(&threads[t], NULL, joint_attn_thread_worker, &work[t]) == 0;
+#endif
                 if (!ok[t]) joint_attn_thread_worker(&work[t]);
             }
             for (int t = 0; t < nthreads; t++) {
-                if (ok[t]) pthread_join(threads[t], NULL);
+                if (ok[t]) {
+#ifdef _WIN32
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+#else
+                    pthread_join(threads[t], NULL);
+#endif
+                }
             }
+            free(threads); free(work); free(ok);
         }
     }
 #else

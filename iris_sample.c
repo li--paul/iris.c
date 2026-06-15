@@ -7,12 +7,11 @@
 
 #include "iris.h"
 #include "iris_kernels.h"
+#include "iris_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
-#include <sys/time.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
@@ -20,9 +19,9 @@
 
 /* Timing utilities for performance analysis - use wall-clock time */
 static double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    iris_timeval_t tv;
+    iris_gettimeofday(&tv);
+    return tv.sec * 1000.0 + tv.usec / 1000.0;
 }
 
 /* Cumulative timing for denoising breakdown */
