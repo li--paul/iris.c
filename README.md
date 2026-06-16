@@ -422,16 +422,35 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 - The fastest implementation for Metal remains [the Draw Things app](https://drawthings.ai/) that can produce a 1024x1024 image in just 14.23 seconds (in the same hardware), however it is worth noting that it uses 6-bit quantized weights, while this implementation uses the official BF16 weights. The 6-bit quantization used by Draw Things provides both a big memory win and a moderate speed advantage (not nearly as much as it could in an LLM, where causal attention is dominated by memory bandwidth); if we account for this, the performance is comparable.
 
-### CUDA Benchmarks (v1 backend)
+### CUDA Backend Status
 
-The CUDA backend is a first implementation (v1) — linear layers run on GPU via cuBLAS, while attention and text encoding run on CPU (BLAS). Full GPU acceleration for these paths is work in progress. Timings on **NVIDIA RTX 6000 Ada Generation** (48 GB VRAM):
+The CUDA backend uses cuBLAS for large linear layers and custom CUDA kernels for the FLUX single-stream transformer path. The single-stream blocks keep their hidden state and scratch tensors resident on the GPU across the block chain, with CUDA kernels for fused QKV/MLP splitting, QK RMSNorm, RoPE, SwiGLU concat, gated residual add, and attention. This avoids the previous per-layer host/device round trips through the 20 single blocks.
+
+The CUDA chained single-block path is enabled by default. To compare against the older fallback path, set:
+
+```bash
+IRIS_CUDA_DISABLE_CHAINED_SINGLE=1 ./iris ...
+```
+
+Current limitations: the text encoder still runs on CPU, and some transformer work outside the single-stream chain still uses the existing CUDA/BLAS path. Timings on **NVIDIA RTX 6000 Ada Generation** (48 GB VRAM):
 
 | Size | Steps | Backend | Time |
 |------|-------|---------|------|
-| 64x64 | 2 | CUDA (v1) | ~60s |
-| 256x256 | 4 | CUDA (v1) | ~100s |
+| 64x64 | 2 | CUDA | passes quick test |
+| 512x512 | 4 | CUDA fallback single blocks | 104.1s |
+| 512x512 | 4 | CUDA chained single blocks | 55.2s |
 
-On WSL2, the CUDA attention path is disabled due to a driver JIT bug; it falls back to BLAS automatically. On native Linux the v1 path is the same (linear layers on GPU, attention on CPU).
+The 512x512 4-step benchmark above uses `flux-klein-4b`, prompt `"A red apple on a wooden table"`, seed `123`. The chained path is about **1.9x faster** for this case while matching the reference image within the normal CUDA tolerance (`mean_diff=2.12`, `max_diff=24`).
+
+Validation on the RTX 6000 Ada build:
+
+```bash
+make cuda
+python3 run_test.py --quick   # PASS: mean_diff=1.14, max_diff=14
+make test                     # 3 passed, 0 failed
+```
+
+On WSL2, older CUDA attention code may still hit driver/toolkit JIT issues on some systems. If CUDA attention allocation or JIT fails, Iris falls back to the safer path where available.
 
 ### Community Benchmarks
 
@@ -445,7 +464,7 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 | MacBook Pro M1 Max | MPS | 39.9s |
 | Apple M1 Pro | MPS | 42.4s |
 | AMD Ryzen 7800X3D | BLAS | 47.8s |
-| RTX 6000 Ada (WSL2) | CUDA+BLAS | ~tbd |
+| RTX 6000 Ada | CUDA | 55.2s |
 | Intel i5-1135G7 | BLAS | 218s |
 
 ## Resolution Limits
