@@ -1,6 +1,6 @@
 # Iris - a C inference pipeline for image synthesis models
 
-Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS (macOS), CUDA (NVIDIA), and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
 
 The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
@@ -23,10 +23,15 @@ make mps       # Apple Silicon (fastest)
 # or: make generic # Pure C, no dependencies
 ```
 
-**Windows (MSVC + oneMKL):**
+**Windows (MSVC + oneMKL or CUDA):**
 ```powershell
+# BLAS (oneMKL accelerated, requires LP64 interface)
 cmake -B build -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64
 cmake --build build --config Release
+
+# CUDA GPU acceleration (NVIDIA RTX, requires CUDA 12+)
+cmake -B build_cuda -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64 -DUSE_CUDA=ON
+cmake --build build_cuda --config Release
 ```
 
 ```bash
@@ -63,7 +68,7 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 ./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
 
-That's it. No Python runtime or CUDA toolkit required at inference time.
+That's it. No Python runtime required at inference time.
 
 ## Example Output
 
@@ -80,7 +85,7 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 ## Features
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
-- **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
+- **Metal / CUDA GPU acceleration**: Metal on Apple Silicon Macs (matches PyTorch MPS). CUDA on NVIDIA GPUs (fp32, cuBLAS + custom kernels, single-block chained path)
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts (Flux models)
@@ -309,12 +314,16 @@ make info       # Show available backends for this platform
 
 ### Windows (CMake + MSVC)
 
-Requires [Visual Studio 2022](https://visualstudio.microsoft.com/) with C++ tools and [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) (optional).
+Requires [Visual Studio 2022](https://visualstudio.microsoft.com/) with C++ tools, [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) (optional), and/or [CUDA Toolkit 12+](https://developer.nvidia.com/cuda-downloads) (optional).
 
 ```powershell
 # BLAS (oneMKL accelerated, requires LP64 interface)
 cmake -B build -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64
 cmake --build build --config Release
+
+# CUDA GPU acceleration (NVIDIA RTX)
+cmake -B build_cuda -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64 -DUSE_CUDA=ON
+cmake --build build_cuda --config Release
 
 # Pure C (no acceleration, very slow)
 cmake -B build_generic -DUSE_BLAS=OFF
@@ -330,6 +339,19 @@ $env:PATH = "C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin;C:\Program Files
 ```
 
 Without these DLLs, MKL silently falls back to single-threaded sequential execution (equivalent to pure C speed).
+
+**CUDA runtime PATH:** The CUDA build requires `cublas64_*.dll` (from CUDA toolkit `bin/`) at runtime. Add it to PATH:
+
+```powershell
+$env:PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin;" + $env:PATH
+```
+
+Without these DLLs, the executable fails to start with `STATUS_DLL_NOT_FOUND (0xC0000135)`.
+
+**Runtime DLL PATH (all):**
+```powershell
+$env:PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin;C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin;C:\Program Files (x86)\Intel\oneAPI\2025.0\bin;" + $env:PATH
+```
 
 ## Testing
 
@@ -438,7 +460,8 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 | Apple M1 Pro | MPS | 42.4s |
 | AMD Ryzen 7800X3D | BLAS | 47.8s |
 | Intel i5-1135G7 | BLAS | 218s |
-| Intel i9-13900K (Win/MSVC) | MKL (LP64) | ~70s (256x256, 4 steps) |
+| Intel i9-13900K + RTX 6000 Ada (Win/MSVC) | CUDA + MKL | **~102s** (256x256, 4 steps) |
+| Intel i9-13900K (Win/MSVC) | MKL (LP64) | ~115s (256x256, 4 steps) |
 
 ## Resolution Limits
 
@@ -613,6 +636,8 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 **Performance varies by backend:**
 
 - **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
+
+- **CUDA (NVIDIA):** mmap is **not recommended** — weights must be uploaded to GPU memory via cuBLAS/custom kernels. With mmap, each block's bf16 weights are converted to f32 on the GPU on first use and cached. Without mmap (`--no-mmap`), conversion happens once at load time. Use `--no-mmap` for CUDA to avoid repeated mmap page faults.
 
 - **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 
