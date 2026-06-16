@@ -211,6 +211,133 @@ __global__ static void conv2d_add_bias_kernel(float *out, const float *bias,
     out[idx] += bias[oc];
 }
 
+__global__ static void split_qkv_mlp_kernel(const float *fused,
+                                            float *q, float *k, float *v,
+                                            float *gate, float *up,
+                                            int seq, int hidden, int mlp_hidden) {
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    int total_hidden = seq * hidden;
+    int total_mlp = seq * mlp_hidden;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_hidden) {
+        int s = idx / hidden;
+        int d = idx % hidden;
+        const float *row = fused + (size_t)s * fused_dim;
+        q[idx] = row[d];
+        k[idx] = row[hidden + d];
+        v[idx] = row[hidden * 2 + d];
+    }
+
+    if (idx < total_mlp) {
+        int s = idx / mlp_hidden;
+        int d = idx % mlp_hidden;
+        const float *row = fused + (size_t)s * fused_dim;
+        gate[idx] = row[hidden * 3 + d];
+        up[idx] = row[hidden * 3 + mlp_hidden + d];
+    }
+}
+
+__global__ static void qk_rms_norm_kernel(float *q, float *k,
+                                          const float *q_weight, const float *k_weight,
+                                          int seq, int heads, int head_dim, float eps) {
+    extern __shared__ float ss[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int total_rows = seq * heads;
+    if (row >= total_rows) return;
+
+    float *qh = q + (size_t)row * head_dim;
+    float *kh = k + (size_t)row * head_dim;
+
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float qv = qh[d];
+        float kv = kh[d];
+        sum_q += qv * qv;
+        sum_k += kv * kv;
+    }
+    ss[tid] = sum_q;
+    ss[blockDim.x + tid] = sum_k;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            ss[tid] += ss[tid + stride];
+            ss[blockDim.x + tid] += ss[blockDim.x + tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float inv_q = rsqrtf(ss[0] / head_dim + eps);
+    float inv_k = rsqrtf(ss[blockDim.x] / head_dim + eps);
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        qh[d] = qh[d] * inv_q * q_weight[d];
+        kh[d] = kh[d] * inv_k * k_weight[d];
+    }
+}
+
+__global__ static void rope_unified_kernel(float *q, float *k,
+                                           const float *txt_cos, const float *txt_sin,
+                                           const float *img_cos, const float *img_sin,
+                                           int seq, int img_offset, int heads, int head_dim) {
+    int pairs = head_dim / 2;
+    int total = seq * heads * pairs;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int pair = idx % pairs;
+    int h = (idx / pairs) % heads;
+    int s = idx / (pairs * heads);
+    int d = pair * 2;
+    const float *cos_row;
+    const float *sin_row;
+    if (s < img_offset) {
+        cos_row = txt_cos + (size_t)s * head_dim;
+        sin_row = txt_sin + (size_t)s * head_dim;
+    } else {
+        int img_s = s - img_offset;
+        cos_row = img_cos + (size_t)img_s * head_dim;
+        sin_row = img_sin + (size_t)img_s * head_dim;
+    }
+
+    float c = cos_row[d];
+    float sn = sin_row[d];
+    float *qv = q + ((size_t)s * heads + h) * head_dim + d;
+    float *kv = k + ((size_t)s * heads + h) * head_dim + d;
+
+    float q0 = qv[0];
+    float q1 = qv[1];
+    qv[0] = q0 * c - q1 * sn;
+    qv[1] = q1 * c + q0 * sn;
+
+    float k0 = kv[0];
+    float k1 = kv[1];
+    kv[0] = k0 * c - k1 * sn;
+    kv[1] = k1 * c + k0 * sn;
+}
+
+__global__ static void concat_attn_mlp_kernel(const float *attn, const float *mlp,
+                                              float *out, int seq, int hidden, int mlp_hidden) {
+    int out_dim = hidden + mlp_hidden;
+    int total = seq * out_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int s = idx / out_dim;
+    int d = idx % out_dim;
+    if (d < hidden) out[idx] = attn[(size_t)s * hidden + d];
+    else out[idx] = mlp[(size_t)s * mlp_hidden + (d - hidden)];
+}
+
+__global__ static void gated_add_kernel(float *hidden_buf, const float *gate,
+                                        const float *proj, int total, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    hidden_buf[idx] += gate[idx % hidden] * proj[idx];
+}
+
 __global__ static void attention_fused_kernel(float *out,
                                               const float *Q, const float *K, const float *V,
                                               int seq_q, int seq_k, int heads, int head_dim,
@@ -261,6 +388,71 @@ __global__ static void attention_fused_kernel(float *out,
         }
         out[(size_t)q_idx * hidden + h * head_dim + d] = acc / denom;
     }
+}
+
+extern "C" int iris_cuda_split_qkv_mlp_device(const float *d_fused,
+                                               float *d_q, float *d_k, float *d_v,
+                                               float *d_gate, float *d_up,
+                                               int seq, int hidden, int mlp_hidden) {
+    int total_hidden = seq * hidden;
+    int total_mlp = seq * mlp_hidden;
+    int total = total_hidden > total_mlp ? total_hidden : total_mlp;
+    if (!d_fused || !d_q || !d_k || !d_v || !d_gate || !d_up || total <= 0) return 0;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    split_qkv_mlp_kernel<<<grid, block>>>(d_fused, d_q, d_k, d_v, d_gate, d_up,
+                                          seq, hidden, mlp_hidden);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" int iris_cuda_qk_rms_norm_device(float *d_q, float *d_k,
+                                             const float *d_q_weight, const float *d_k_weight,
+                                             int seq, int heads, int head_dim, float eps) {
+    if (!d_q || !d_k || !d_q_weight || !d_k_weight || seq <= 0 || heads <= 0 || head_dim <= 0) return 0;
+    int threads = 256;
+    if (head_dim < threads) {
+        threads = 1;
+        while (threads < head_dim) threads <<= 1;
+        if (threads < 32) threads = 32;
+    }
+    qk_rms_norm_kernel<<<seq * heads, threads, (size_t)threads * 2 * sizeof(float)>>>(
+        d_q, d_k, d_q_weight, d_k_weight, seq, heads, head_dim, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" int iris_cuda_rope_unified_device(float *d_q, float *d_k,
+                                              const float *d_txt_cos, const float *d_txt_sin,
+                                              const float *d_img_cos, const float *d_img_sin,
+                                              int seq, int img_offset, int heads, int head_dim) {
+    int total = seq * heads * (head_dim / 2);
+    if (!d_q || !d_k || !d_txt_cos || !d_txt_sin || !d_img_cos || !d_img_sin ||
+        total <= 0 || (head_dim & 1)) return 0;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    rope_unified_kernel<<<grid, block>>>(d_q, d_k, d_txt_cos, d_txt_sin,
+                                         d_img_cos, d_img_sin,
+                                         seq, img_offset, heads, head_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" int iris_cuda_concat_attn_mlp_device(const float *d_attn, const float *d_mlp,
+                                                 float *d_out, int seq, int hidden, int mlp_hidden) {
+    int total = seq * (hidden + mlp_hidden);
+    if (!d_attn || !d_mlp || !d_out || total <= 0) return 0;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    concat_attn_mlp_kernel<<<grid, block>>>(d_attn, d_mlp, d_out, seq, hidden, mlp_hidden);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" int iris_cuda_gated_add_device(float *d_hidden, const float *d_gate,
+                                           const float *d_proj, int seq, int hidden) {
+    int total = seq * hidden;
+    if (!d_hidden || !d_gate || !d_proj || total <= 0) return 0;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    gated_add_kernel<<<grid, block>>>(d_hidden, d_gate, d_proj, total, hidden);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 extern "C" int iris_cuda_softmax_inplace(float *d_x, int rows, int cols) {

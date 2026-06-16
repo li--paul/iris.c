@@ -31,6 +31,11 @@ static struct {
 } weight_cache[MAX_CACHED_WEIGHTS];
 static int num_cached = 0;
 
+struct iris_cuda_tensor {
+    float *ptr;
+    size_t size;
+};
+
 static int cuda_check(cudaError_t err, const char *msg) {
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA ERROR [%s]: %s\n", msg, cudaGetErrorString(err));
@@ -58,6 +63,25 @@ static float *cuda_upload(const float *src, size_t n) {
 
 static void cuda_download(float *dst, const float *src, size_t n) {
     cuda_check(cudaMemcpy(dst, src, n * sizeof(float), cudaMemcpyDeviceToHost), "download memcpy");
+}
+
+static float *cuda_get_cached_weight(const float *src, size_t n) {
+    if (!src || n == 0) return NULL;
+    for (int i = 0; i < num_cached; i++) {
+        if (weight_cache[i].cpu_ptr == src && weight_cache[i].size == n) {
+            return weight_cache[i].gpu_ptr;
+        }
+    }
+
+    float *dst = cuda_upload(src, n);
+    if (!dst) return NULL;
+    if (num_cached < MAX_CACHED_WEIGHTS) {
+        weight_cache[num_cached].cpu_ptr = src;
+        weight_cache[num_cached].gpu_ptr = dst;
+        weight_cache[num_cached].size = n;
+        num_cached++;
+    }
+    return dst;
 }
 
 /* Row-major → cuBLAS column-major adapter.
@@ -108,6 +132,71 @@ void iris_cuda_cleanup(void) {
 
 void iris_cuda_sync(void) {
     if (cuda_handle) cudaDeviceSynchronize();
+}
+
+iris_cuda_tensor_t iris_cuda_tensor_alloc(size_t num_elements) {
+    if (num_elements == 0) return NULL;
+    iris_cuda_tensor_t t = (iris_cuda_tensor_t)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    if (!cuda_check(cudaMalloc((void**)&t->ptr, num_elements * sizeof(float)), "tensor alloc")) {
+        free(t);
+        return NULL;
+    }
+    t->size = num_elements;
+    return t;
+}
+
+iris_cuda_tensor_t iris_cuda_tensor_create(const float *data, size_t num_elements) {
+    iris_cuda_tensor_t t = iris_cuda_tensor_alloc(num_elements);
+    if (!t) return NULL;
+    if (data && !cuda_check(cudaMemcpy(t->ptr, data, num_elements * sizeof(float),
+                                       cudaMemcpyHostToDevice), "tensor create memcpy")) {
+        iris_cuda_tensor_free(t);
+        return NULL;
+    }
+    return t;
+}
+
+void iris_cuda_tensor_free(iris_cuda_tensor_t tensor) {
+    if (!tensor) return;
+    if (tensor->ptr) cudaFree(tensor->ptr);
+    free(tensor);
+}
+
+int iris_cuda_tensor_read(iris_cuda_tensor_t tensor, float *out) {
+    if (!tensor || !tensor->ptr || !out) return 0;
+    return cuda_check(cudaMemcpy(out, tensor->ptr, tensor->size * sizeof(float),
+                                 cudaMemcpyDeviceToHost), "tensor read");
+}
+
+int iris_cuda_tensor_write(iris_cuda_tensor_t tensor, const float *data) {
+    if (!tensor || !tensor->ptr || !data) return 0;
+    return cuda_check(cudaMemcpy(tensor->ptr, data, tensor->size * sizeof(float),
+                                 cudaMemcpyHostToDevice), "tensor write");
+}
+
+float *iris_cuda_tensor_data(iris_cuda_tensor_t tensor) {
+    return tensor ? tensor->ptr : NULL;
+}
+
+size_t iris_cuda_tensor_size(iris_cuda_tensor_t tensor) {
+    return tensor ? tensor->size : 0;
+}
+
+int iris_cuda_linear_tensor(iris_cuda_tensor_t out, iris_cuda_tensor_t x,
+                            const float *W, int seq_len, int in_dim, int out_dim,
+                            int cache_weight) {
+    if (!out || !x || !out->ptr || !x->ptr || !W) return 0;
+    if (x->size < (size_t)seq_len * in_dim || out->size < (size_t)seq_len * out_dim) return 0;
+
+    size_t w_size = (size_t)out_dim * in_dim;
+    float *dW = cache_weight ? cuda_get_cached_weight(W, w_size) : cuda_upload(W, w_size);
+    if (!dW) return 0;
+
+    cuda_gemm(0, 1, seq_len, out_dim, in_dim, 1.0f,
+              x->ptr, in_dim, dW, in_dim, 0.0f, out->ptr, out_dim);
+    if (!cache_weight) cudaFree(dW);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -296,6 +385,141 @@ int iris_cuda_apply_rope(float *x, const float *freqs,
     return ok;
 }
 
+int iris_cuda_split_qkv_mlp(iris_cuda_tensor_t fused,
+                            iris_cuda_tensor_t q, iris_cuda_tensor_t k, iris_cuda_tensor_t v,
+                            iris_cuda_tensor_t gate, iris_cuda_tensor_t up,
+                            int seq, int hidden, int mlp_hidden) {
+    if (!fused || !q || !k || !v || !gate || !up) return 0;
+    return iris_cuda_split_qkv_mlp_device(fused->ptr, q->ptr, k->ptr, v->ptr,
+                                          gate->ptr, up->ptr, seq, hidden, mlp_hidden);
+}
+
+int iris_cuda_qk_rms_norm(iris_cuda_tensor_t q, iris_cuda_tensor_t k,
+                          const float *q_weight, const float *k_weight,
+                          int seq, int heads, int head_dim, float eps) {
+    if (!q || !k || !q_weight || !k_weight) return 0;
+    float *dq_weight = cuda_upload(q_weight, head_dim);
+    if (!dq_weight) return 0;
+    float *dk_weight = cuda_upload(k_weight, head_dim);
+    if (!dk_weight) { cudaFree(dq_weight); return 0; }
+    int ok = iris_cuda_qk_rms_norm_device(q->ptr, k->ptr, dq_weight, dk_weight,
+                                          seq, heads, head_dim, eps);
+    cudaFree(dq_weight);
+    cudaFree(dk_weight);
+    return ok;
+}
+
+int iris_cuda_rope_unified(iris_cuda_tensor_t q, iris_cuda_tensor_t k,
+                           const float *txt_cos, const float *txt_sin,
+                           const float *img_cos, const float *img_sin,
+                           int seq, int img_offset, int heads, int head_dim) {
+    if (!q || !k || !txt_cos || !txt_sin || !img_cos || !img_sin) return 0;
+    int img_seq = seq - img_offset;
+    if (img_seq <= 0 || img_offset <= 0) return 0;
+    float *dtxt_cos = cuda_upload(txt_cos, (size_t)img_offset * head_dim);
+    if (!dtxt_cos) return 0;
+    float *dtxt_sin = cuda_upload(txt_sin, (size_t)img_offset * head_dim);
+    if (!dtxt_sin) { cudaFree(dtxt_cos); return 0; }
+    float *dimg_cos = cuda_upload(img_cos, (size_t)img_seq * head_dim);
+    if (!dimg_cos) { cudaFree(dtxt_cos); cudaFree(dtxt_sin); return 0; }
+    float *dimg_sin = cuda_upload(img_sin, (size_t)img_seq * head_dim);
+    if (!dimg_sin) { cudaFree(dtxt_cos); cudaFree(dtxt_sin); cudaFree(dimg_cos); return 0; }
+
+    int ok = iris_cuda_rope_unified_device(q->ptr, k->ptr, dtxt_cos, dtxt_sin,
+                                           dimg_cos, dimg_sin,
+                                           seq, img_offset, heads, head_dim);
+    cudaFree(dtxt_cos);
+    cudaFree(dtxt_sin);
+    cudaFree(dimg_cos);
+    cudaFree(dimg_sin);
+    return ok;
+}
+
+int iris_cuda_attention_tensor(iris_cuda_tensor_t out,
+                               iris_cuda_tensor_t q, iris_cuda_tensor_t k, iris_cuda_tensor_t v,
+                               int seq_q, int seq_k, int heads, int head_dim, float scale) {
+    if (!out || !q || !k || !v) return 0;
+    int hidden = heads * head_dim;
+    size_t q_size = (size_t)seq_q * hidden;
+    size_t k_size = (size_t)seq_k * hidden;
+
+    if (iris_cuda_attention_fused_device(out->ptr, q->ptr, k->ptr, v->ptr,
+                                         seq_q, seq_k, heads, head_dim, scale)) {
+        return 1;
+    }
+
+    size_t head_size = (size_t)seq_q * head_dim;
+    size_t kv_head_size = (size_t)seq_k * head_dim;
+    size_t scores_size = (size_t)seq_q * seq_k;
+
+    size_t total_gpu = q_size + k_size + k_size + q_size + ((size_t)heads * scores_size);
+    float *gpu_buf = NULL;
+    if (!cuda_check(cudaMalloc((void**)&gpu_buf, total_gpu * sizeof(float)), "attn tensor scratch")) {
+        return 0;
+    }
+
+    float *dq = gpu_buf;
+    float *dk = dq + q_size;
+    float *dv = dk + k_size;
+    float *do_t = dv + k_size;
+    float *ds = do_t + q_size;
+
+    if (!iris_cuda_transpose_shd_to_hsd(q->ptr, dq, seq_q, heads, head_dim) ||
+        !iris_cuda_transpose_shd_to_hsd(k->ptr, dk, seq_k, heads, head_dim) ||
+        !iris_cuda_transpose_shd_to_hsd(v->ptr, dv, seq_k, heads, head_dim)) {
+        goto fail;
+    }
+
+    for (int h = 0; h < heads; h++) {
+        float *qh = dq + (size_t)h * head_size;
+        float *kh = dk + (size_t)h * kv_head_size;
+        float *sh = ds + (size_t)h * scores_size;
+        cuda_gemm(0, 1, seq_q, seq_k, head_dim, scale,
+                  qh, head_dim, kh, head_dim, 0.0f, sh, seq_k);
+    }
+    iris_cuda_sync();
+    if (!iris_cuda_softmax_inplace(ds, heads * seq_q, seq_k)) goto fail;
+
+    for (int h = 0; h < heads; h++) {
+        float *sh = ds + (size_t)h * scores_size;
+        float *vh = dv + (size_t)h * kv_head_size;
+        float *oh = do_t + (size_t)h * head_size;
+        cuda_gemm(0, 0, seq_q, head_dim, seq_k, 1.0f,
+                  sh, seq_k, vh, head_dim, 0.0f, oh, head_dim);
+    }
+    iris_cuda_sync();
+    if (!iris_cuda_transpose_hsd_to_shd(do_t, out->ptr, seq_q, heads, head_dim)) goto fail;
+
+    cudaFree(gpu_buf);
+    return 1;
+
+fail:
+    if (gpu_buf) cudaFree(gpu_buf);
+    return 0;
+}
+
+int iris_cuda_silu_mul_tensor(iris_cuda_tensor_t gate, iris_cuda_tensor_t up, int n) {
+    if (!gate || !up) return 0;
+    return iris_cuda_silu_mul_device(gate->ptr, up->ptr, n);
+}
+
+int iris_cuda_concat_attn_mlp(iris_cuda_tensor_t attn, iris_cuda_tensor_t mlp,
+                              iris_cuda_tensor_t out, int seq, int hidden, int mlp_hidden) {
+    if (!attn || !mlp || !out) return 0;
+    return iris_cuda_concat_attn_mlp_device(attn->ptr, mlp->ptr, out->ptr,
+                                            seq, hidden, mlp_hidden);
+}
+
+int iris_cuda_gated_add(iris_cuda_tensor_t hidden, const float *gate,
+                        iris_cuda_tensor_t proj, int seq, int hidden_dim) {
+    if (!hidden || !proj || !gate) return 0;
+    float *dgate = cuda_upload(gate, hidden_dim);
+    if (!dgate) return 0;
+    int ok = iris_cuda_gated_add_device(hidden->ptr, dgate, proj->ptr, seq, hidden_dim);
+    cudaFree(dgate);
+    return ok;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Convolution via im2col + GEMM                                      */
 /* ------------------------------------------------------------------ */
@@ -412,13 +636,8 @@ int iris_cuda_attention(float *out,
         float *sh = ds + h * scores_size;
 
         /* scores_h[seq_q, seq_k] = Q_h[seq_q, head_dim] @ K_h^T[head_dim, seq_k] */
-        cublasSgemm(cuda_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                    seq_q, seq_k, head_dim,
-                    &scale,
-                    qh, head_dim,
-                    kh, head_dim,
-                    &(float){0.0f},
-                    sh, seq_k);
+        cuda_gemm(0, 1, seq_q, seq_k, head_dim, scale,
+                  qh, head_dim, kh, head_dim, 0.0f, sh, seq_k);
     }
 
     iris_cuda_sync();
@@ -434,13 +653,8 @@ int iris_cuda_attention(float *out,
         float *vh = dv + h * kv_head_size;
         float *oh = do_t + h * head_size;
 
-        cublasSgemm(cuda_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    seq_q, head_dim, seq_k,
-                    &(float){1.0f},
-                    sh, seq_k,
-                    vh, head_dim,
-                    &(float){0.0f},
-                    oh, head_dim);
+        cuda_gemm(0, 0, seq_q, head_dim, seq_k, 1.0f,
+                  sh, seq_k, vh, head_dim, 0.0f, oh, head_dim);
     }
 
     iris_cuda_sync();

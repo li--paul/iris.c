@@ -143,6 +143,22 @@ static inline void gated_add(float *out, const float *gate, const float *proj,
     }
 }
 
+static void linear_nobias_naive(float *y, const float *x, const float *W,
+                                int seq_len, int in_dim, int out_dim) {
+    for (int s = 0; s < seq_len; s++) {
+        const float *x_row = x + (size_t)s * in_dim;
+        float *y_row = y + (size_t)s * out_dim;
+        for (int o = 0; o < out_dim; o++) {
+            const float *w_row = W + (size_t)o * in_dim;
+            float sum = 0.0f;
+            for (int i = 0; i < in_dim; i++) {
+                sum += x_row[i] * w_row[i];
+            }
+            y_row[o] = sum;
+        }
+    }
+}
+
 /* ========================================================================
  * Transformer Data Structures
  * ======================================================================== */
@@ -3365,6 +3381,361 @@ cleanup:
 }
 #endif /* USE_METAL */
 
+#ifdef USE_CUDA
+typedef struct {
+    int seq;
+    int hidden;
+    int mlp_hidden;
+    int fused_dim;
+    iris_cuda_tensor_t norm;
+    iris_cuda_tensor_t fused;
+    iris_cuda_tensor_t q;
+    iris_cuda_tensor_t k;
+    iris_cuda_tensor_t v;
+    iris_cuda_tensor_t gate_mlp;
+    iris_cuda_tensor_t up;
+    iris_cuda_tensor_t attn_out;
+    iris_cuda_tensor_t concat;
+    iris_cuda_tensor_t proj_out;
+} single_block_cuda_scratch_t;
+
+static void single_block_cuda_scratch_free(single_block_cuda_scratch_t *s) {
+    if (!s) return;
+    iris_cuda_tensor_free(s->norm);
+    iris_cuda_tensor_free(s->fused);
+    iris_cuda_tensor_free(s->q);
+    iris_cuda_tensor_free(s->k);
+    iris_cuda_tensor_free(s->v);
+    iris_cuda_tensor_free(s->gate_mlp);
+    iris_cuda_tensor_free(s->up);
+    iris_cuda_tensor_free(s->attn_out);
+    iris_cuda_tensor_free(s->concat);
+    iris_cuda_tensor_free(s->proj_out);
+    memset(s, 0, sizeof(*s));
+}
+
+static int single_block_cuda_scratch_init(single_block_cuda_scratch_t *s,
+                                          int seq, int hidden, int mlp_hidden) {
+    if (!s || seq <= 0 || hidden <= 0 || mlp_hidden <= 0) return 0;
+    memset(s, 0, sizeof(*s));
+    s->seq = seq;
+    s->hidden = hidden;
+    s->mlp_hidden = mlp_hidden;
+    s->fused_dim = hidden * 3 + mlp_hidden * 2;
+
+    s->norm = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->fused = iris_cuda_tensor_alloc((size_t)seq * s->fused_dim);
+    s->q = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->k = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->v = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->gate_mlp = iris_cuda_tensor_alloc((size_t)seq * mlp_hidden);
+    s->up = iris_cuda_tensor_alloc((size_t)seq * mlp_hidden);
+    s->attn_out = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->concat = iris_cuda_tensor_alloc((size_t)seq * (hidden + mlp_hidden));
+    s->proj_out = iris_cuda_tensor_alloc((size_t)seq * hidden);
+
+    if (!s->norm || !s->fused || !s->q || !s->k || !s->v ||
+        !s->gate_mlp || !s->up || !s->attn_out || !s->concat || !s->proj_out) {
+        single_block_cuda_scratch_free(s);
+        return 0;
+    }
+    return 1;
+}
+
+static int single_block_forward_cuda_chained(iris_cuda_tensor_t hidden_gpu,
+                                             const single_block_t *block,
+                                             iris_cuda_tensor_t shift_gpu, iris_cuda_tensor_t scale_gpu,
+                                             const float *gate,
+                                             const float *img_rope_cos, const float *img_rope_sin,
+                                             const float *txt_rope_cos, const float *txt_rope_sin,
+                                             int seq, int img_offset, iris_transformer_flux_t *tf,
+                                             single_block_cuda_scratch_t *scratch,
+                                             int cache_weights, int block_idx) {
+    if (!iris_cuda_available() || !hidden_gpu || !shift_gpu || !scale_gpu ||
+        !block || !block->qkv_mlp_weight || !block->proj_mlp_weight) {
+        return 0;
+    }
+    if (!scratch || scratch->seq != seq || scratch->hidden != tf->hidden_size ||
+        scratch->mlp_hidden != tf->mlp_hidden) {
+        return 0;
+    }
+
+    int hidden = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    float eps = 1e-6f;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    const char *debug_block_env = getenv("IRIS_CUDA_CHAINED_DEBUG_BLOCK");
+    int debug_block = debug_block_env ? atoi(debug_block_env) : 0;
+    int debug = (block_idx == debug_block && getenv("IRIS_CUDA_CHAINED_DEBUG"));
+    float *debug_hidden = NULL;
+    float *debug_shift = NULL;
+    float *debug_scale = NULL;
+    float *debug_norm = NULL;
+    float *debug_fused = NULL;
+    float *debug_q = NULL;
+    float *debug_k = NULL;
+    float *debug_v = NULL;
+    float *debug_gate_mlp = NULL;
+    float *debug_up = NULL;
+    float *debug_attn = NULL;
+    float *debug_concat = NULL;
+    float *debug_proj = NULL;
+    float *debug_gpu = NULL;
+    if (debug) {
+        debug_hidden = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_shift = (float *)malloc((size_t)hidden * sizeof(float));
+        debug_scale = (float *)malloc((size_t)hidden * sizeof(float));
+        debug_norm = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_fused = (float *)malloc((size_t)seq * fused_dim * sizeof(float));
+        debug_q = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_k = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_v = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_gate_mlp = (float *)malloc((size_t)seq * mlp_hidden * sizeof(float));
+        debug_up = (float *)malloc((size_t)seq * mlp_hidden * sizeof(float));
+        debug_attn = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_concat = (float *)malloc((size_t)seq * (hidden + mlp_hidden) * sizeof(float));
+        debug_proj = (float *)malloc((size_t)seq * hidden * sizeof(float));
+        debug_gpu = (float *)malloc((size_t)seq * fused_dim * sizeof(float));
+        if (!debug_hidden || !debug_shift || !debug_scale || !debug_norm || !debug_fused ||
+            !debug_q || !debug_k || !debug_v || !debug_gate_mlp || !debug_up ||
+            !debug_attn || !debug_concat || !debug_proj || !debug_gpu) {
+            debug = 0;
+        } else {
+            iris_cuda_tensor_read(hidden_gpu, debug_hidden);
+            iris_cuda_tensor_read(shift_gpu, debug_shift);
+            iris_cuda_tensor_read(scale_gpu, debug_scale);
+        }
+    }
+
+    if (!iris_cuda_adaln_norm_device(iris_cuda_tensor_data(scratch->norm),
+                                     iris_cuda_tensor_data(hidden_gpu),
+                                     iris_cuda_tensor_data(shift_gpu),
+                                     iris_cuda_tensor_data(scale_gpu),
+                                     seq, hidden, eps)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        apply_adaln(debug_norm, debug_hidden, debug_shift, debug_scale, seq, hidden, eps);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->norm, debug_gpu);
+        double mean = 0.0;
+        float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_norm[j] - debug_gpu[j]);
+            mean += d;
+            if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] adaln mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_linear_tensor(scratch->fused, scratch->norm,
+                                 block->qkv_mlp_weight,
+                                 seq, hidden, fused_dim, cache_weights)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        linear_nobias_naive(debug_fused, debug_norm, block->qkv_mlp_weight, seq, hidden, fused_dim);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->fused, debug_gpu);
+        double mean = 0.0;
+        float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * fused_dim; j < n; j++) {
+            float d = fabsf(debug_fused[j] - debug_gpu[j]);
+            mean += d;
+            if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * fused_dim);
+        fprintf(stderr, "[cuda block0] fused_linear mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_split_qkv_mlp(scratch->fused,
+                                 scratch->q, scratch->k, scratch->v,
+                                 scratch->gate_mlp, scratch->up,
+                                 seq, hidden, mlp_hidden)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        for (int s = 0; s < seq; s++) {
+            float *row = debug_fused + (size_t)s * fused_dim;
+            memcpy(debug_q + (size_t)s * hidden, row, hidden * sizeof(float));
+            memcpy(debug_k + (size_t)s * hidden, row + hidden, hidden * sizeof(float));
+            memcpy(debug_v + (size_t)s * hidden, row + hidden * 2, hidden * sizeof(float));
+            memcpy(debug_gate_mlp + (size_t)s * mlp_hidden, row + hidden * 3, mlp_hidden * sizeof(float));
+            memcpy(debug_up + (size_t)s * mlp_hidden, row + hidden * 3 + mlp_hidden, mlp_hidden * sizeof(float));
+        }
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->q, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_q[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] split_q mean=%.6g max=%.6g\n", mean, maxd);
+        iris_cuda_tensor_read(scratch->gate_mlp, debug_gpu);
+        mean = 0.0; maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * mlp_hidden; j < n; j++) {
+            float d = fabsf(debug_gate_mlp[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * mlp_hidden);
+        fprintf(stderr, "[cuda block0] split_gate mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_qk_rms_norm(scratch->q, scratch->k,
+                               block->norm_q_weight, block->norm_k_weight,
+                               seq, heads, head_dim, eps)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        apply_qk_norm(debug_q, debug_k, block->norm_q_weight, block->norm_k_weight,
+                      seq, heads, head_dim, eps);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->q, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_q[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] q_norm mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_rope_unified(scratch->q, scratch->k,
+                                txt_rope_cos, txt_rope_sin,
+                                img_rope_cos, img_rope_sin,
+                                seq, img_offset, heads, head_dim)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        apply_rope_2d(debug_q, txt_rope_cos, txt_rope_sin, img_offset, heads, head_dim, 32);
+        apply_rope_2d(debug_k, txt_rope_cos, txt_rope_sin, img_offset, heads, head_dim, 32);
+        apply_rope_2d(debug_q + (size_t)img_offset * hidden, img_rope_cos, img_rope_sin,
+                      seq - img_offset, heads, head_dim, 32);
+        apply_rope_2d(debug_k + (size_t)img_offset * hidden, img_rope_cos, img_rope_sin,
+                      seq - img_offset, heads, head_dim, 32);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->q, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_q[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] rope_q mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_attention_tensor(scratch->attn_out,
+                                    scratch->q, scratch->k, scratch->v,
+                                    seq, seq, heads, head_dim, attn_scale)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        iris_cuda_attention(debug_attn, debug_q, debug_k, debug_v,
+                            seq, seq, heads, head_dim, attn_scale);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->attn_out, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_attn[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] attention mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_silu_mul_tensor(scratch->gate_mlp, scratch->up, seq * mlp_hidden)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        iris_silu_mul(debug_gate_mlp, debug_up, seq * mlp_hidden);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->gate_mlp, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * mlp_hidden; j < n; j++) {
+            float d = fabsf(debug_gate_mlp[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * mlp_hidden);
+        fprintf(stderr, "[cuda block0] swiglu mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_concat_attn_mlp(scratch->attn_out, scratch->gate_mlp, scratch->concat,
+                                   seq, hidden, mlp_hidden)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        for (int s = 0; s < seq; s++) {
+            memcpy(debug_concat + (size_t)s * (hidden + mlp_hidden),
+                   debug_attn + (size_t)s * hidden, hidden * sizeof(float));
+            memcpy(debug_concat + (size_t)s * (hidden + mlp_hidden) + hidden,
+                   debug_gate_mlp + (size_t)s * mlp_hidden, mlp_hidden * sizeof(float));
+        }
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->concat, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * (hidden + mlp_hidden); j < n; j++) {
+            float d = fabsf(debug_concat[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * (hidden + mlp_hidden));
+        fprintf(stderr, "[cuda block0] concat mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    if (!iris_cuda_linear_tensor(scratch->proj_out, scratch->concat,
+                                 block->proj_mlp_weight,
+                                 seq, hidden + mlp_hidden, hidden, cache_weights)) {
+        goto fail_debug;
+    }
+    if (debug) {
+        linear_nobias_naive(debug_proj, debug_concat, block->proj_mlp_weight,
+                            seq, hidden + mlp_hidden, hidden);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(scratch->proj_out, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_proj[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] proj_linear mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    int ok = iris_cuda_gated_add(hidden_gpu, gate, scratch->proj_out, seq, hidden);
+    if (debug && ok) {
+        gated_add(debug_hidden, gate, debug_proj, seq, hidden);
+        iris_cuda_sync();
+        iris_cuda_tensor_read(hidden_gpu, debug_gpu);
+        double mean = 0.0; float maxd = 0.0f;
+        for (size_t j = 0, n = (size_t)seq * hidden; j < n; j++) {
+            float d = fabsf(debug_hidden[j] - debug_gpu[j]);
+            mean += d; if (d > maxd) maxd = d;
+        }
+        mean /= (double)((size_t)seq * hidden);
+        fprintf(stderr, "[cuda block0] gated_add mean=%.6g max=%.6g\n", mean, maxd);
+    }
+    free(debug_hidden); free(debug_shift); free(debug_scale); free(debug_norm); free(debug_fused);
+    free(debug_q); free(debug_k); free(debug_v); free(debug_gate_mlp); free(debug_up);
+    free(debug_attn); free(debug_concat); free(debug_proj); free(debug_gpu);
+    return ok;
+
+fail_debug:
+    free(debug_hidden); free(debug_shift); free(debug_scale); free(debug_norm); free(debug_fused);
+    free(debug_q); free(debug_k); free(debug_v); free(debug_gate_mlp); free(debug_up);
+    free(debug_attn); free(debug_concat); free(debug_proj); free(debug_gpu);
+    return 0;
+}
+#endif /* USE_CUDA */
+
+static void dump_single_block_if_requested(const char *prefix, int block_idx,
+                                           const float *hidden, size_t count) {
+    const char *want_env = getenv("IRIS_DUMP_SINGLE_BLOCK");
+    if (!prefix || !hidden || !want_env) return;
+    int want = atoi(want_env);
+    if (want != block_idx) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s.%02d.bin", prefix, block_idx);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    fwrite(hidden, sizeof(float), count, fp);
+    fclose(fp);
+}
+
 /* Single-stream DiT block operating on concatenated [text, image] tokens.
  * Unlike double blocks, text and image share the same self-attention and are
  * processed as one sequence. Uses a fused projection that outputs [Q, K, V,
@@ -3684,9 +4055,12 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, img_hidden,
            img_seq * hidden * sizeof(float));
+    dump_single_block_if_requested(getenv("IRIS_DUMP_SINGLE_BLOCK_PREFIX"), -1,
+                                   concat_hidden, (size_t)total_seq * hidden);
 
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
+    int single_blocks_done = 0;
 
 #ifdef USE_METAL
     /* Try BF16 native path first */
@@ -3858,11 +4232,93 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             iris_gpu_tensor_free(concat_hidden_gpu);
             concat_hidden_gpu = NULL;
         }
+        single_blocks_done = (bf16_path_ok || gpu_chained_ok);
     }
-
-    /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
-    if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
+
+#ifdef USE_CUDA
+    if (!single_blocks_done && iris_cuda_available() &&
+        !getenv("IRIS_CUDA_DISABLE_CHAINED_SINGLE")) {
+        int cuda_chained_ok = 0;
+        iris_cuda_tensor_t concat_hidden_cuda = iris_cuda_tensor_create(concat_hidden, (size_t)total_seq * hidden);
+        if (concat_hidden_cuda) {
+            int mod_size = hidden * 3;
+            for (int j = 0; j < hidden; j++) {
+                float x = t_emb[j];
+                tf->t_emb_silu[j] = x / (1.0f + expf(-x));
+            }
+            int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+            float *mod_params = tf->work2 + total_seq * fused_dim;
+            iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+            float *precomputed_shift = mod_params;
+            float *precomputed_scale = mod_params + hidden;
+            float *precomputed_gate = mod_params + hidden * 2;
+            float *single_shift_host = (float *)malloc((size_t)hidden * sizeof(float));
+            float *single_scale_host = (float *)malloc((size_t)hidden * sizeof(float));
+            float *single_gate_host = (float *)malloc((size_t)hidden * sizeof(float));
+            if (single_shift_host && single_scale_host && single_gate_host) {
+                memcpy(single_shift_host, precomputed_shift, (size_t)hidden * sizeof(float));
+                memcpy(single_scale_host, precomputed_scale, (size_t)hidden * sizeof(float));
+                memcpy(single_gate_host, precomputed_gate, (size_t)hidden * sizeof(float));
+            }
+
+            iris_cuda_tensor_t shift_cuda = iris_cuda_tensor_create(single_shift_host, hidden);
+            iris_cuda_tensor_t scale_cuda = iris_cuda_tensor_create(single_scale_host, hidden);
+            single_block_cuda_scratch_t scratch;
+            int scratch_ok = single_block_cuda_scratch_init(&scratch, total_seq, hidden, tf->mlp_hidden);
+
+            cuda_chained_ok = (single_shift_host && single_scale_host && single_gate_host &&
+                               shift_cuda && scale_cuda && scratch_ok);
+            int cache_weights = !tf->use_mmap;
+            for (int i = 0; i < tf->num_single_layers && cuda_chained_ok; i++) {
+                if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                                 && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
+                    load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
+                                              tf->hidden_size, tf->mlp_hidden, 0);
+                }
+
+                if (!single_block_forward_cuda_chained(concat_hidden_cuda, &tf->single_blocks[i],
+                                                       shift_cuda, scale_cuda, single_gate_host,
+                                                       img_rope_cos, img_rope_sin,
+                                                       txt_rope_cos, txt_rope_sin,
+                                                       total_seq, txt_seq, tf,
+                                                       &scratch, cache_weights, i)) {
+                    cuda_chained_ok = 0;
+                    iris_cuda_tensor_read(concat_hidden_cuda, concat_hidden);
+                }
+
+                const char *dump_prefix = getenv("IRIS_DUMP_SINGLE_BLOCK_PREFIX");
+                const char *dump_block = getenv("IRIS_DUMP_SINGLE_BLOCK");
+                if (cuda_chained_ok && dump_prefix && dump_block && atoi(dump_block) == i) {
+                    iris_cuda_sync();
+                    iris_cuda_tensor_read(concat_hidden_cuda, concat_hidden);
+                    dump_single_block_if_requested(dump_prefix, i, concat_hidden, (size_t)total_seq * hidden);
+                }
+
+                if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+                if (iris_substep_callback)
+                    iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
+            }
+
+            if (cuda_chained_ok) {
+                iris_cuda_sync();
+                iris_cuda_tensor_read(concat_hidden_cuda, concat_hidden);
+                single_blocks_done = 1;
+            }
+
+            if (scratch_ok) single_block_cuda_scratch_free(&scratch);
+            iris_cuda_tensor_free(shift_cuda);
+            iris_cuda_tensor_free(scale_cuda);
+            free(single_shift_host);
+            free(single_scale_host);
+            free(single_gate_host);
+            iris_cuda_tensor_free(concat_hidden_cuda);
+        }
+    }
+#endif
+
+    /* Fall back to per-block GPU/CPU path if chained paths failed */
+    if (!single_blocks_done) {
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand and free after use */
             if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
@@ -3887,6 +4343,8 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                                      total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
             }
             if (tf->use_mmap) free_single_block_weights(&tf->single_blocks[i]);
+            dump_single_block_if_requested(getenv("IRIS_DUMP_SINGLE_BLOCK_PREFIX"), i,
+                                           concat_hidden, (size_t)total_seq * hidden);
             if (iris_substep_callback)
                 iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
 
@@ -3900,9 +4358,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             }
 #endif
         }
-#ifdef USE_METAL
     }
-#endif
 
     double single_time = tf_get_time_ms() - single_start;
 
