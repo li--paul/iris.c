@@ -114,6 +114,9 @@ endif
 # Backend: cuda (NVIDIA GPU with cuBLAS)
 # =============================================================================
 CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -DUSE_BLAS -I/usr/local/cuda/targets/x86_64-linux/include
+NVCC ?= nvcc
+NVCC_HOST_CXX ?= /usr/bin/g++-13
+CUDA_NVCCFLAGS = -O3 -std=c++11 -ccbin $(NVCC_HOST_CXX) -U_GNU_SOURCE -U_DEFAULT_SOURCE -D_ISOC11_SOURCE -I/usr/local/cuda/targets/x86_64-linux/include
 CUDA_LDFLAGS = -L/usr/local/cuda/targets/x86_64-linux/lib -lcublas -lcudart -lopenblas -lm
 
 cuda: CFLAGS = $(CUDA_CFLAGS)
@@ -121,11 +124,14 @@ cuda: clean cuda-build
 	@echo ""
 	@echo "Built with CUDA backend (cuBLAS GPU acceleration)"
 
-cuda-build: $(OBJS) $(CLI_OBJS) iris_cuda.o main.o
+cuda-build: $(OBJS) $(CLI_OBJS) iris_cuda.o iris_cuda_kernels.o main.o
 	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
 
 iris_cuda.o: iris_cuda.c iris_cuda.h
 	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+iris_cuda_kernels.o: iris_cuda_kernels.cu iris_cuda.h
+	$(NVCC) $(CUDA_NVCCFLAGS) -c -o $@ $<
 
 # =============================================================================
 # Build rules
@@ -173,7 +179,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 iris_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o iris_cuda.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o iris_cuda.o iris_cuda_kernels.o main.o $(TARGET) $(LIB)
 	rm -f iris_shaders_source.h
 
 info:

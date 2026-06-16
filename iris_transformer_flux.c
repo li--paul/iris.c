@@ -1215,6 +1215,13 @@ static void time_embed_forward(float *out, const float *t_sincos,
 static void apply_adaln(float *out, const float *x,
                         const float *shift, const float *scale,
                         int seq, int hidden, float eps) {
+#ifdef USE_CUDA
+    if (iris_cuda_available() && (size_t)seq * hidden >= 1024 * 1024 &&
+        iris_cuda_adaln_norm(out, x, shift, scale, seq, hidden, eps)) {
+        return;
+    }
+#endif
+
     /* Layer Norm (subtract mean, divide by std) + AdaLN modulation
      * Note: Flux2 uses LayerNorm with elementwise_affine=False (no learned weights)
      * Vectorized using Accelerate framework on Apple platforms.

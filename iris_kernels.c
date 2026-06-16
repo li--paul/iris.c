@@ -527,6 +527,13 @@ void iris_rms_norm(float *out, const float *x, const float *weight,
         return;
     }
 #endif
+#ifdef USE_CUDA
+    size_t elements_cuda = (size_t)seq_len * hidden;
+    if (iris_cuda_available() && elements_cuda >= 1024 * 1024 &&
+        iris_cuda_rms_norm(out, x, weight, seq_len, hidden, eps)) {
+        return;
+    }
+#endif
 
     for (int s = 0; s < seq_len; s++) {
         const float *x_row = x + s * hidden;
@@ -637,6 +644,12 @@ void iris_silu_mul(float *gate, const float *up, int n) {
 #ifdef USE_METAL
     if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
         iris_metal_silu_mul(gate, up, n);
+        return;
+    }
+#endif
+#ifdef USE_CUDA
+    if (iris_cuda_available() && n >= 4 * 1024 * 1024 &&
+        iris_cuda_silu_mul(gate, up, n)) {
         return;
     }
 #endif
@@ -1047,6 +1060,13 @@ void iris_apply_rope(float *x, const float *freqs,
     /* x: [batch, seq, heads, head_dim]
      * freqs: [seq, head_dim/2, 2] (cos, sin)
      * Apply rotary embedding to pairs of dimensions */
+#ifdef USE_CUDA
+    size_t elements = (size_t)batch * seq * heads * head_dim;
+    if (iris_cuda_available() && elements >= 1024 * 1024 &&
+        iris_cuda_apply_rope(x, freqs, batch, seq, heads, head_dim)) {
+        return;
+    }
+#endif
 
     int half_dim = head_dim / 2;
 

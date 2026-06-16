@@ -6,6 +6,15 @@
 #include <string.h>
 #include <math.h>
 
+extern int iris_cuda_silu_mul_device(float *d_gate, const float *d_up, int n);
+extern int iris_cuda_rms_norm_device(float *d_out, const float *d_x, const float *d_weight,
+                                     int rows, int hidden, float eps);
+extern int iris_cuda_adaln_norm_device(float *d_out, const float *d_x,
+                                       const float *d_shift, const float *d_scale,
+                                       int rows, int hidden, float eps);
+extern int iris_cuda_apply_rope_device(float *d_x, const float *d_freqs,
+                                       int batch, int seq, int heads, int head_dim);
+
 static cublasHandle_t cuda_handle = NULL;
 static int cuda_initialized = 0;
 static int cuda_in_batch = 0;
@@ -204,18 +213,87 @@ void iris_cuda_linear(float *y, const float *x, const float *W, const float *b,
     cuda_gemm(0, 1, seq_len, out_dim, in_dim, 1.0f, dx, in_dim, dW, in_dim, 0.0f, dy, out_dim);
 
     if (b) {
-        /* Add bias: for each seq, add b[0..out_dim) */
         float *db = cuda_upload(b, out_dim);
         if (db) {
-            for (int s = 0; s < seq_len; s++) {
-                cublasSaxpy(cuda_handle, out_dim, &(float){1.0f}, db, 1, dy + s * out_dim, 1);
-            }
+            iris_cuda_add_bias_rows(dy, db, seq_len, out_dim);
             cudaFree(db);
         }
     }
 
     cuda_download(y, dy, (size_t)seq_len * out_dim);
     cudaFree(dx); cudaFree(dW); cudaFree(dy);
+}
+
+int iris_cuda_rms_norm(float *out, const float *x, const float *weight,
+                       int seq_len, int hidden, float eps) {
+    size_t elements = (size_t)seq_len * hidden;
+    float *dx = cuda_upload(x, elements);
+    if (!dx) return 0;
+    float *dw = cuda_upload(weight, hidden);
+    if (!dw) { cudaFree(dx); return 0; }
+    float *dy = NULL;
+    if (!cuda_check(cudaMalloc((void**)&dy, elements * sizeof(float)), "rms norm malloc")) {
+        cudaFree(dx); cudaFree(dw);
+        return 0;
+    }
+
+    int ok = iris_cuda_rms_norm_device(dy, dx, dw, seq_len, hidden, eps);
+    if (ok) cuda_download(out, dy, elements);
+
+    cudaFree(dx); cudaFree(dw); cudaFree(dy);
+    return ok;
+}
+
+int iris_cuda_adaln_norm(float *out, const float *x,
+                         const float *shift, const float *scale,
+                         int seq_len, int hidden, float eps) {
+    size_t elements = (size_t)seq_len * hidden;
+    float *dx = cuda_upload(x, elements);
+    if (!dx) return 0;
+    float *dshift = cuda_upload(shift, hidden);
+    if (!dshift) { cudaFree(dx); return 0; }
+    float *dscale = cuda_upload(scale, hidden);
+    if (!dscale) { cudaFree(dx); cudaFree(dshift); return 0; }
+    float *dy = NULL;
+    if (!cuda_check(cudaMalloc((void**)&dy, elements * sizeof(float)), "adaln malloc")) {
+        cudaFree(dx); cudaFree(dshift); cudaFree(dscale);
+        return 0;
+    }
+
+    int ok = iris_cuda_adaln_norm_device(dy, dx, dshift, dscale, seq_len, hidden, eps);
+    if (ok) cuda_download(out, dy, elements);
+
+    cudaFree(dx); cudaFree(dshift); cudaFree(dscale); cudaFree(dy);
+    return ok;
+}
+
+int iris_cuda_silu_mul(float *gate, const float *up, int n) {
+    float *dg = cuda_upload(gate, n);
+    if (!dg) return 0;
+    float *du = cuda_upload(up, n);
+    if (!du) { cudaFree(dg); return 0; }
+
+    int ok = iris_cuda_silu_mul_device(dg, du, n);
+    if (ok) cuda_download(gate, dg, n);
+
+    cudaFree(dg); cudaFree(du);
+    return ok;
+}
+
+int iris_cuda_apply_rope(float *x, const float *freqs,
+                         int batch, int seq, int heads, int head_dim) {
+    size_t elements = (size_t)batch * seq * heads * head_dim;
+    size_t freq_elements = (size_t)seq * (head_dim / 2) * 2;
+    float *dx = cuda_upload(x, elements);
+    if (!dx) return 0;
+    float *df = cuda_upload(freqs, freq_elements);
+    if (!df) { cudaFree(dx); return 0; }
+
+    int ok = iris_cuda_apply_rope_device(dx, df, batch, seq, heads, head_dim);
+    if (ok) cuda_download(x, dx, elements);
+
+    cudaFree(dx); cudaFree(df);
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */
@@ -233,60 +311,44 @@ void iris_cuda_conv2d(float *out, const float *in, const float *weight, const fl
     size_t col_n = (size_t)K * tile_pixels;
     if (col_n < MIN_CUDA_ELEMENTS) return; /* fall back to CPU */
 
-    float *col = (float *)malloc(col_n * sizeof(float));
-    if (!col) return;
+    float *din = cuda_upload(in, (size_t)batch * in_ch * H * W);
+    if (!din) return;
 
-    /* im2col on CPU, GEMM on GPU */
-    for (int ic = 0; ic < in_ch; ic++) {
-        for (int kh = 0; kh < kH; kh++) {
-            for (int kw = 0; kw < kW; kw++) {
-                int col_row = ic * kH * kW + kh * kW + kw;
-                for (int oh = 0; oh < outH; oh++) {
-                    int ih = oh * stride - padding + kh;
-                    for (int ow = 0; ow < outW; ow++) {
-                        int iw = ow * stride - padding + kw;
-                        int col_idx = col_row * tile_pixels + oh * outW + ow;
-                        if (ih >= 0 && ih < H && iw >= 0 && iw < W)
-                            col[col_idx] = in[ic * H * W + ih * W + iw];
-                        else
-                            col[col_idx] = 0.0f;
-                    }
-                }
-            }
-        }
+    float *dcol = NULL;
+    if (!cuda_check(cudaMalloc((void**)&dcol, col_n * sizeof(float)), "im2col malloc")) {
+        cudaFree(din);
+        return;
     }
 
-    /* Upload col and weight to GPU */
-    float *dcol = cuda_upload(col, col_n);
-    free(col);
-    if (!dcol) return;
-
     float *dw = cuda_upload(weight, (size_t)out_ch * K);
-    if (!dw) { cudaFree(dcol); return; }
+    if (!dw) { cudaFree(din); cudaFree(dcol); return; }
 
     float *dout = NULL;
     cudaMalloc((void**)&dout, (size_t)batch * out_ch * tile_pixels * sizeof(float));
-    if (!dout) { cudaFree(dcol); cudaFree(dw); return; }
+    if (!dout) { cudaFree(din); cudaFree(dcol); cudaFree(dw); return; }
 
     for (int b = 0; b < batch; b++) {
+        float *din_b = din + (size_t)b * in_ch * H * W;
         float *dout_b = dout + b * out_ch * tile_pixels;
+        if (!iris_cuda_im2col(din_b, dcol, in_ch, H, W, kH, kW, stride, padding, outH, outW)) {
+            cudaFree(din); cudaFree(dcol); cudaFree(dw); cudaFree(dout);
+            return;
+        }
         cuda_gemm(0, 0, out_ch, tile_pixels, K,
                   1.0f, dw, K, dcol, tile_pixels, 0.0f, dout_b, tile_pixels);
     }
 
-    cuda_download(out, dout, (size_t)batch * out_ch * tile_pixels);
-
     if (bias) {
-        for (int b = 0; b < batch; b++) {
-            for (int oc = 0; oc < out_ch; oc++) {
-                float b_val = bias[oc];
-                float *out_boc = out + (b * out_ch + oc) * tile_pixels;
-                for (int i = 0; i < tile_pixels; i++) out_boc[i] += b_val;
-            }
+        float *db = cuda_upload(bias, out_ch);
+        if (db) {
+            iris_cuda_conv2d_add_bias(dout, db, batch, out_ch, tile_pixels);
+            cudaFree(db);
         }
     }
 
-    cudaFree(dcol); cudaFree(dw); cudaFree(dout);
+    cuda_download(out, dout, (size_t)batch * out_ch * tile_pixels);
+
+    cudaFree(din); cudaFree(dcol); cudaFree(dw); cudaFree(dout);
 }
 
 /* --------------------------------------------------------------- */
@@ -299,64 +361,55 @@ int iris_cuda_attention(float *out,
                         float scale) {
     int hidden = heads * head_dim;
 
+    size_t q_size = (size_t)seq_q * hidden;
+    size_t k_size = (size_t)seq_k * hidden;
     size_t head_size = (size_t)seq_q * head_dim;
+    size_t kv_head_size = (size_t)seq_k * head_dim;
     size_t scores_size = (size_t)seq_q * seq_k;
-    float *q_t = (float *)malloc(heads * head_size * sizeof(float));
-    float *k_t = (float *)malloc(heads * head_size * sizeof(float));
-    float *v_t = (float *)malloc(heads * (size_t)seq_k * head_dim * sizeof(float));
-    float *scores = (float *)malloc(heads * scores_size * sizeof(float));
-    float *out_t = (float *)malloc(heads * head_size * sizeof(float));
-
-    if (!q_t || !k_t || !v_t || !scores || !out_t) {
-        free(q_t); free(k_t); free(v_t); free(scores); free(out_t);
-        return 0;
-    }
-
-    /* Q: [seq_q, heads*head_dim] → [heads, seq_q, head_dim] */
-    for (int h = 0; h < heads; h++) {
-        for (int s = 0; s < seq_q; s++) {
-            for (int d = 0; d < head_dim; d++) {
-                q_t[h * head_size + s * head_dim + d] = Q[s * hidden + h * head_dim + d];
-            }
-        }
-    }
-    /* K, V: [seq_k, heads*head_dim] → [heads, seq_k, head_dim] */
-    for (int h = 0; h < heads; h++) {
-        for (int s = 0; s < seq_k; s++) {
-            for (int d = 0; d < head_dim; d++) {
-                k_t[h * (size_t)seq_k * head_dim + s * head_dim + d] = K[s * hidden + h * head_dim + d];
-                v_t[h * (size_t)seq_k * head_dim + s * head_dim + d] = V[s * hidden + h * head_dim + d];
-            }
-        }
-    }
 
     /* Allocate all GPU buffers in one chunk to avoid WSL driver heap issue */
-    size_t k_size = heads * (size_t)seq_k * head_dim;
-    size_t total_gpu = (heads * head_size * 3) + (heads * scores_size) + k_size;
+    size_t total_gpu = (q_size * 4) + (k_size * 4) + ((size_t)heads * scores_size);
     float *gpu_buf = NULL;
     cudaError_t ce = cudaMalloc((void**)&gpu_buf, total_gpu * sizeof(float));
     if (ce != cudaSuccess || !gpu_buf) {
-        free(q_t); free(k_t); free(v_t); free(scores); free(out_t);
         return 0;
     }
-    float *dq = gpu_buf;
-    float *do_t = dq + heads * head_size;
-    float *ds = do_t + heads * head_size;
-    float *dv = ds + heads * scores_size;
-    float *dk = dv + k_size;
 
-    cudaMemcpy(dq, q_t, heads * head_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dk, k_t, k_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dv, v_t, k_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(ds, scores, heads * scores_size * sizeof(float), cudaMemcpyHostToDevice);
+    float *dq_shd = gpu_buf;
+    float *dk_shd = dq_shd + q_size;
+    float *dv_shd = dk_shd + k_size;
+    float *do_shd = dv_shd + k_size;
+    float *dq = do_shd + q_size;
+    float *dk = dq + q_size;
+    float *dv = dk + k_size;
+    float *do_t = dv + k_size;
+    float *ds = do_t + q_size;
+
+    cudaMemcpy(dq_shd, Q, q_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dk_shd, K, k_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dv_shd, V, k_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    if (getenv("IRIS_CUDA_FUSED_ATTN") &&
+        iris_cuda_attention_fused_device(do_shd, dq_shd, dk_shd, dv_shd,
+                                         seq_q, seq_k, heads, head_dim, scale)) {
+        iris_cuda_sync();
+        cuda_download(out, do_shd, q_size);
+        cudaFree(gpu_buf);
+        return 1;
+    }
+
+    if (!iris_cuda_transpose_shd_to_hsd(dq_shd, dq, seq_q, heads, head_dim) ||
+        !iris_cuda_transpose_shd_to_hsd(dk_shd, dk, seq_k, heads, head_dim) ||
+        !iris_cuda_transpose_shd_to_hsd(dv_shd, dv, seq_k, heads, head_dim)) {
+        cudaFree(gpu_buf);
+        return 0;
+    }
 
     /* Per-head cuBLAS calls (avoids cublasSgemmStridedBatched bug in WSL driver) */
     for (int h = 0; h < heads; h++) {
         float *qh = dq + h * head_size;
-        float *kh = dk + h * (size_t)seq_k * head_dim;
-        float *vh = dv + h * (size_t)seq_k * head_dim;
+        float *kh = dk + h * kv_head_size;
         float *sh = ds + h * scores_size;
-        float *oh = do_t + h * head_size;
 
         /* scores_h[seq_q, seq_k] = Q_h[seq_q, head_dim] @ K_h^T[head_dim, seq_k] */
         cublasSgemm(cuda_handle, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -370,29 +423,15 @@ int iris_cuda_attention(float *out,
 
     iris_cuda_sync();
 
-    /* Download scores, softmax on CPU, upload back */
-    cuda_download(scores, ds, heads * scores_size);
-
-    for (size_t h = 0; h < (size_t)heads; h++) {
-        float *sh = scores + h * scores_size;
-        for (int i = 0; i < seq_q; i++) {
-            float *row = sh + i * seq_k;
-            float max_val = row[0];
-            for (int j = 1; j < seq_k; j++) if (row[j] > max_val) max_val = row[j];
-
-            float sum = 0.0f;
-            for (int j = 0; j < seq_k; j++) { row[j] = expf(row[j] - max_val); sum += row[j]; }
-            float inv_sum = 1.0f / sum;
-            for (int j = 0; j < seq_k; j++) row[j] *= inv_sum;
-        }
+    if (!iris_cuda_softmax_inplace(ds, heads * seq_q, seq_k)) {
+        cudaFree(gpu_buf);
+        return 0;
     }
-
-    cudaMemcpy(ds, scores, heads * scores_size * sizeof(float), cudaMemcpyHostToDevice);
 
     /* out_h[seq_q, head_dim] = scores_h[seq_q, seq_k] @ V_h[seq_k, head_dim] */
     for (int h = 0; h < heads; h++) {
         float *sh = ds + h * scores_size;
-        float *vh = dv + h * (size_t)seq_k * head_dim;
+        float *vh = dv + h * kv_head_size;
         float *oh = do_t + h * head_size;
 
         cublasSgemm(cuda_handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -406,19 +445,13 @@ int iris_cuda_attention(float *out,
 
     iris_cuda_sync();
 
-    /* Download and transpose back HSD → SHD */
-    cuda_download(out_t, do_t, heads * head_size);
-
-    for (int h = 0; h < heads; h++) {
-        for (int s = 0; s < seq_q; s++) {
-            for (int d = 0; d < head_dim; d++) {
-                out[s * hidden + h * head_dim + d] = out_t[h * head_size + s * head_dim + d];
-            }
-        }
+    if (!iris_cuda_transpose_hsd_to_shd(do_t, do_shd, seq_q, heads, head_dim)) {
+        cudaFree(gpu_buf);
+        return 0;
     }
+    cuda_download(out, do_shd, q_size);
 
     cudaFree(gpu_buf);
-    free(q_t); free(k_t); free(v_t); free(scores); free(out_t);
     return 1;
 }
 
