@@ -73,10 +73,12 @@ static void cuda_check(cudaError_t err, const char *msg) {
     }
 }
 
-static void cublas_check(cublasStatus_t status, const char *msg) {
+static int cublas_check(cublasStatus_t status, const char *msg) {
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "cuBLAS error [%s]: %d\n", msg, (int)status);
+        return 0;
     }
+    return 1;
 }
 
 /* ========================================================================
@@ -159,22 +161,23 @@ static float *weight_cache_get(const void *cpu_ptr, size_t num_elements, int is_
     if (g_weight_cache_count >= MAX_WEIGHT_ENTRIES) return NULL;
 
     float *gpu_ptr = NULL;
-    cudaMalloc(&gpu_ptr, num_elements * sizeof(float));
-    if (!gpu_ptr) return NULL;
+    cudaError_t ce = cudaMalloc(&gpu_ptr, num_elements * sizeof(float));
+    if (ce != cudaSuccess || !gpu_ptr) return NULL;
+    gpu_ptr = gpu_ptr; /* suppress unused warning */
 
     if (is_bf16) {
         uint16_t *tmp = NULL;
-        cudaMalloc(&tmp, num_elements * sizeof(uint16_t));
-        if (tmp) {
-            cudaMemcpy(tmp, cpu_ptr, num_elements * sizeof(uint16_t), cudaMemcpyHostToDevice);
-            /* Launch kernel to convert bf16 -> f32 on GPU */
-            dim3 block(256);
-            dim3 grid((num_elements + 255) / 256);
-            bf16_to_f32_kernel<<<grid, block, 0, g_stream>>>(gpu_ptr, tmp, (int)num_elements);
-            cudaFree(tmp);
-        }
+        ce = cudaMalloc(&tmp, num_elements * sizeof(uint16_t));
+        if (ce != cudaSuccess || !tmp) { cudaFree(gpu_ptr); return NULL; }
+        ce = cudaMemcpy(tmp, cpu_ptr, num_elements * sizeof(uint16_t), cudaMemcpyHostToDevice);
+        if (ce != cudaSuccess) { cudaFree(tmp); cudaFree(gpu_ptr); return NULL; }
+        dim3 block(256);
+        dim3 grid((num_elements + 255) / 256);
+        bf16_to_f32_kernel<<<grid, block, 0, g_stream>>>(gpu_ptr, tmp, (int)num_elements);
+        cudaFree(tmp);
     } else {
-        cudaMemcpy(gpu_ptr, cpu_ptr, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+        ce = cudaMemcpy(gpu_ptr, cpu_ptr, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+        if (ce != cudaSuccess) { cudaFree(gpu_ptr); return NULL; }
     }
 
     g_weight_cache[g_weight_cache_count].cpu_ptr = cpu_ptr;
@@ -449,6 +452,31 @@ int iris_cuda_init(void) {
     }
     cublasSetStream(g_cublas, g_stream);
 
+    /* Sanity check: run a tiny SGEMM to verify cuBLAS works */
+    {
+        float *d_a, *d_b, *d_c;
+        float one = 1.0f, zero = 0.0f;
+        if (cudaMalloc(&d_a, 16 * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&d_b, 16 * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&d_c, 4 * sizeof(float)) != cudaSuccess) {
+            cublasDestroy(g_cublas);
+            cudaStreamDestroy(g_stream);
+            g_cublas = NULL; g_stream = NULL;
+            return 0;
+        }
+        cublasStatus_t cs = cublasSgemm(g_cublas,
+            CUBLAS_OP_T, CUBLAS_OP_N, 4, 1, 4,
+            &one, d_a, 4, d_b, 4, &zero, d_c, 4);
+        cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
+        if (cs != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr, "cuBLAS sanity check failed: %d\n", (int)cs);
+            cublasDestroy(g_cublas);
+            cudaStreamDestroy(g_stream);
+            g_cublas = NULL; g_stream = NULL;
+            return 0;
+        }
+    }
+
     g_initialized = 1;
     return 1;
 }
@@ -609,24 +637,23 @@ int iris_cuda_linear_into(iris_cuda_tensor_t out, iris_cuda_tensor_t x,
      * Using CUBLAS_OP_T on W: W stored as [in_dim×out_dim] col-major, ld=in_dim
      * Using CUBLAS_OP_N on x: x stored as [in_dim×seq] col-major, ld=in_dim */
     float alpha = 1.0f, beta = 0.0f;
-    cublas_check(cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                             out_dim, seq_len, in_dim,
-                             &alpha,
-                             W_gpu, in_dim,
-                             d_x, in_dim,
-                             &beta,
-                             d_out, out_dim),
-                 "linear sgemm");
+    if (!cublas_check(cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                  out_dim, seq_len, in_dim,
+                                  &alpha,
+                                  W_gpu, in_dim,
+                                  d_x, in_dim,
+                                  &beta,
+                                  d_out, out_dim),
+                      "linear sgemm")) return 0;
 
     if (b) {
         float *b_gpu = weight_cache_get(b, out_dim, 0);
         if (b_gpu) {
-            /* out[i,:] += b */
             for (int s = 0; s < seq_len; s++) {
-                cublas_check(cublasSaxpy(g_cublas, out_dim, &alpha,
-                                         b_gpu, 1,
-                                         d_out + s * out_dim, 1),
-                             "linear bias add");
+                if (!cublas_check(cublasSaxpy(g_cublas, out_dim, &alpha,
+                                              b_gpu, 1,
+                                              d_out + s * out_dim, 1),
+                                  "linear bias add")) return 0;
             }
         }
     }
@@ -649,14 +676,14 @@ int iris_cuda_linear_bf16_into(iris_cuda_tensor_t out, iris_cuda_tensor_t x,
     float *d_x = x->device_ptr;
 
     float alpha = 1.0f, beta = 0.0f;
-    cublas_check(cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                             out_dim, seq_len, in_dim,
-                             &alpha,
-                             W_gpu, in_dim,
-                             d_x, in_dim,
-                             &beta,
-                             d_out, out_dim),
-                 "linear bf16 sgemm");
+    if (!cublas_check(cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                  out_dim, seq_len, in_dim,
+                                  &alpha,
+                                  W_gpu, in_dim,
+                                  d_x, in_dim,
+                                  &beta,
+                                  d_out, out_dim),
+                      "linear bf16 sgemm")) return 0;
 
     if (!g_batch_mode) iris_cuda_sync();
     return 1;
@@ -763,111 +790,53 @@ int iris_cuda_attention(iris_cuda_tensor_t out,
     float *d_V = V->device_ptr;
     float *d_out = out->device_ptr;
 
-    int total_seq = seq;
-
-    /* Allocate temp for attention scores [heads, seq, seq] */
-    int score_size = heads * seq * seq;
+    /* Allocate temp for ONE head's attention scores [seq, seq].
+     * Process heads sequentially to reduce peak VRAM from
+     * heads * seq * seq to seq * seq (e.g. 1.1 GB vs 26.5 GB at 1024x1024). */
     float *d_scores = NULL;
-    cudaMalloc(&d_scores, score_size * sizeof(float));
-
-    /* Scores = Q @ K^T: for each head: [seq, head_dim] @ [head_dim, seq] = [seq, seq]
-     * Using cuBLAS batched: 
-     * Q is stored as [seq, heads * head_dim], K as [seq, heads * head_dim]
-     * We need to reshape and do batched gemm.
-     * 
-     * Q_heads[h] = [seq, head_dim] at offset h * head_dim
-     * K_heads[h] = [seq, head_dim] at offset h * head_dim
-     * scores[h] = Q_heads[h] @ K_heads[h]^T  -> [seq, seq]
-     * 
-     * Use cublasSgemmStridedBatched:
-     * C = alpha * A @ B^T + beta * C
-     * A = Q (M=seq, K=head_dim), strideA = head_dim
-     * B = K (N=seq, K=head_dim), strideB = head_dim
-     * C = scores (M=seq, N=seq), strideC = seq*seq
-     * Each head is independent.
-     * 
-     * cuBLAS is column-major, so we need to be careful:
-     * Our tensors are row-major. For row-major: C = A @ B^T (in math notation)
-     * In column-major cuBLAS: C^T = B @ A^T
-     * So we transpose: C^T (col-major) = B @ A^T
-     * In row-major: C = A @ B^T same as col-major: C_T = B @ A_T
-     * 
-     * Actually simpler: For each head, the Q/K data is stored contiguously.
-     * Row-major Q (seq, head_dim) at offset h*head_dim from start.
-     * We want scores[h] = Q[h] @ K[h]^T.
-     * Using cublasSgemm on each head individually is simpler.
-     */
-
-    float alpha = scale;  /* Apply scale inside gemm */
-    float beta = 0.0f;
-
-    for (int h = 0; h < heads; h++) {
-        float *q_head = d_Q + h * head_dim;
-        float *k_head = d_K + h * head_dim;
-        float *s_head = d_scores + h * seq * seq;
-
-        /* scores_head = Q_head @ K_head^T
-         * cuBLAS expects column-major.
-         * Row-major C[M,N] = A[M,K] @ B[N,K]^T
-         * Column-major: same as C^T[N,M] = B[N,K] @ A^T[K,M]
-         * With cublasSgemm:
-         *   C (col-major) = op(A) @ op(B)
-         * We set: op(A) = K_head^T (transpose), op(B) = Q_head^T (transpose)
-         *   C[N,M] = K_head^T[N,K] @ Q_head^T[K,M]  => C = K^T @ Q^T => C = (Q @ K)^T
-         * Wait, that gives us scores^T.
-         * 
-         * Simpler: just do cublasSgemm with:
-         *   Cb = alpha * Ab @ Bb + beta * Cb
-         * A=scores [seq,seq], B=Q [seq,head_dim], C=K [seq,head_dim]
-         * We want scores = Q @ K^T
-         * Column-major: scores^T = K @ Q^T
-         * cublasSgemm('N', 'T', seq, seq, head_dim, alpha, K, seq, Q, seq, beta, scores, seq)
-         * This gives: scores (col-major) = K @ Q^T
-         * scores (row-major) = (K @ Q^T)^T = Q @ K^T ✓ */
-        cublas_check(cublasSgemm(g_cublas,
-                                 CUBLAS_OP_N, CUBLAS_OP_T,
-                                 seq, seq, head_dim,
-                                 &alpha,
-                                 k_head, seq,      /* K: [seq, head_dim], stride=seq */
-                                 q_head, seq,      /* Q: [seq, head_dim], stride=seq */
-                                 &beta,
-                                 s_head, seq),     /* scores: [seq, seq] */
-                     "attn QK");
+    {
+        cudaError_t ce = cudaMalloc(&d_scores, (size_t)seq * seq * sizeof(float));
+        if (ce != cudaSuccess) return 0;
     }
 
-    /* Softmax on scores (in-place) */
-    dim3 sm_grid(heads * seq);
-    dim3 sm_block(256);
-    softmax_kernel<<<sm_grid, sm_block, 0, g_stream>>>(d_scores, heads * seq, seq);
+    float alpha_qk = scale;
+    float alpha_v = 1.0f;
+    float beta = 0.0f;
+    int ok = 1;
 
-    /* scores @ V: for each head: [seq, seq] @ [seq, head_dim] = [seq, head_dim]
-     * scores[h] @ V[h] -> out[h]
-     * scores[h]: [seq, seq], V[h]: [seq, head_dim], out[h]: [seq, head_dim]
-     * cublasSgemm('N', 'N', head_dim, seq, seq, alpha, V, head_dim, scores, seq, beta, out_head, head_dim)
-     * This gives: out (col-major) = V @ scores^T
-     * Wait, we want: out = scores @ V
-     * Column-major: out^T = V^T @ scores^T
-     * cublasSgemm('T', 'T', head_dim, seq, seq, 1.0, V, head_dim, scores, seq, 0, out_head, head_dim)
-     * This gives: out^T (col-major) = V^T @ scores^T = (scores @ V)^T → out = scores @ V ✓ */
-
-    alpha = 1.0f;
-    for (int h = 0; h < heads; h++) {
-        float *s_head = d_scores + h * seq * seq;
+    for (int h = 0; h < heads && ok; h++) {
+        float *q_head = d_Q + h * head_dim;
+        float *k_head = d_K + h * head_dim;
         float *v_head = d_V + h * head_dim;
         float *o_head = d_out + h * head_dim;
 
-        cublas_check(cublasSgemm(g_cublas,
-                                 CUBLAS_OP_T, CUBLAS_OP_T,
-                                 head_dim, seq, seq,
-                                 &alpha,
-                                 v_head, head_dim,   /* V: [seq, head_dim] row-major */
-                                 s_head, seq,        /* scores: [seq, seq] row-major */
-                                 &beta,
-                                 o_head, head_dim),  /* out: [seq, head_dim] row-major */
-                     "attn V");
+        if (!cublas_check(cublasSgemm(g_cublas,
+                                      CUBLAS_OP_N, CUBLAS_OP_T,
+                                      seq, seq, head_dim,
+                                      &alpha_qk,
+                                      k_head, seq,
+                                      q_head, seq,
+                                      &beta,
+                                      d_scores, seq),
+                          "attn QK")) { ok = 0; break; }
+
+        dim3 sm_grid(seq);
+        dim3 sm_block(256);
+        softmax_kernel<<<sm_grid, sm_block, 0, g_stream>>>(d_scores, seq, seq);
+
+        if (!cublas_check(cublasSgemm(g_cublas,
+                                      CUBLAS_OP_T, CUBLAS_OP_T,
+                                      head_dim, seq, seq,
+                                      &alpha_v,
+                                      v_head, head_dim,
+                                      d_scores, seq,
+                                      &beta,
+                                      o_head, head_dim),
+                          "attn V")) { ok = 0; break; }
     }
 
     cudaFree(d_scores);
+    if (!ok) return 0;
 
     if (!g_batch_mode) iris_cuda_sync();
     return 1;
