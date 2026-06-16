@@ -92,6 +92,11 @@ static double tf_get_time_ms(void) {
 #include "iris_metal.h"
 #endif
 
+/* Use CUDA for NVIDIA GPU acceleration */
+#ifdef USE_CUDA
+#include "iris_cuda.h"
+#endif
+
 /* Enable BF16 pipeline debug logging when IRIS_BF16_DEBUG is set. */
 #ifdef USE_METAL
 static int bf16_debug_enabled(void) {
@@ -2820,6 +2825,230 @@ cleanup:
 }
 
 /* ========================================================================
+ * CUDA Single Block Chained Path (f32)
+ * ======================================================================== */
+#endif /* USE_METAL */
+
+#ifdef USE_CUDA
+typedef struct {
+    int seq;
+    int hidden;
+    int mlp_hidden;
+    int fused_dim;
+    iris_cuda_tensor_t norm;
+    iris_cuda_tensor_t fused;
+    iris_cuda_tensor_t q;
+    iris_cuda_tensor_t k;
+    iris_cuda_tensor_t v;
+    iris_cuda_tensor_t gate_mlp;
+    iris_cuda_tensor_t up;
+    iris_cuda_tensor_t attn_out;
+    iris_cuda_tensor_t concat;
+    iris_cuda_tensor_t proj_out;
+} single_block_cuda_scratch_t;
+
+static void single_block_cuda_scratch_free(single_block_cuda_scratch_t *s) {
+    if (!s) return;
+    if (s->norm) iris_cuda_tensor_free(s->norm);
+    if (s->fused) iris_cuda_tensor_free(s->fused);
+    if (s->q) iris_cuda_tensor_free(s->q);
+    if (s->k) iris_cuda_tensor_free(s->k);
+    if (s->v) iris_cuda_tensor_free(s->v);
+    if (s->gate_mlp) iris_cuda_tensor_free(s->gate_mlp);
+    if (s->up) iris_cuda_tensor_free(s->up);
+    if (s->attn_out) iris_cuda_tensor_free(s->attn_out);
+    if (s->concat) iris_cuda_tensor_free(s->concat);
+    if (s->proj_out) iris_cuda_tensor_free(s->proj_out);
+    memset(s, 0, sizeof(*s));
+}
+
+static int single_block_cuda_scratch_init(single_block_cuda_scratch_t *s,
+                                           int seq, int hidden, int mlp_hidden) {
+    if (!s || seq <= 0 || hidden <= 0 || mlp_hidden <= 0) return 0;
+    memset(s, 0, sizeof(*s));
+    s->seq = seq;
+    s->hidden = hidden;
+    s->mlp_hidden = mlp_hidden;
+    s->fused_dim = hidden * 3 + mlp_hidden * 2;
+
+    s->norm = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->fused = iris_cuda_tensor_alloc((size_t)seq * s->fused_dim);
+    s->q = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->k = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->v = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->gate_mlp = iris_cuda_tensor_alloc((size_t)seq * mlp_hidden);
+    s->up = iris_cuda_tensor_alloc((size_t)seq * mlp_hidden);
+    s->attn_out = iris_cuda_tensor_alloc((size_t)seq * hidden);
+    s->concat = iris_cuda_tensor_alloc((size_t)seq * (hidden + mlp_hidden));
+    s->proj_out = iris_cuda_tensor_alloc((size_t)seq * hidden);
+
+    if (!s->norm || !s->fused || !s->q || !s->k || !s->v ||
+        !s->gate_mlp || !s->up || !s->attn_out || !s->concat || !s->proj_out) {
+        single_block_cuda_scratch_free(s);
+        return 0;
+    }
+    return 1;
+}
+
+static int single_block_forward_cuda_chained(iris_cuda_tensor_t hidden_gpu,
+                                              const single_block_t *block,
+                                              const float *shift, const float *scale, const float *gate,
+                                              const float *img_rope_cos, const float *img_rope_sin,
+                                              const float *txt_rope_cos, const float *txt_rope_sin,
+                                              int seq, int img_offset, iris_transformer_flux_t *tf,
+                                              single_block_cuda_scratch_t *scratch) {
+    if (!iris_cuda_available()) return 0;
+    if (!hidden_gpu) return 0;
+
+    int h_size = tf->hidden_size;
+    int heads = tf->num_heads;
+    int head_dim = tf->head_dim;
+    int mlp_hidden = tf->mlp_hidden;
+    int fused_dim = h_size * 3 + mlp_hidden * 2;
+    float eps = 1e-6f;
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    int axis_dim = head_dim / 2;
+
+    /* Use scratch buffers if provided, otherwise allocate locally */
+    int own_tensors = 0;
+    single_block_cuda_scratch_t local_scratch;
+    single_block_cuda_scratch_t *s = scratch;
+
+    if (!s) {
+        memset(&local_scratch, 0, sizeof(local_scratch));
+        s = &local_scratch;
+        own_tensors = 1;
+    }
+
+    /* Pre-allocate if sizes don't match scratch */
+    if (s->seq != seq || s->hidden != h_size || s->mlp_hidden != mlp_hidden) {
+        if (!own_tensors) {
+            /* Scratch provided but wrong size — can't use */
+            return 0;
+        }
+        single_block_cuda_scratch_init(s, seq, h_size, mlp_hidden);
+    }
+
+    iris_cuda_tensor_t norm_gpu = s->norm;
+    iris_cuda_tensor_t fused_result = s->fused;
+    iris_cuda_tensor_t q_gpu = s->q;
+    iris_cuda_tensor_t k_gpu = s->k;
+    iris_cuda_tensor_t v_gpu = s->v;
+    iris_cuda_tensor_t gate_gpu = s->gate_mlp;
+    iris_cuda_tensor_t up_gpu = s->up;
+    iris_cuda_tensor_t attn_out_gpu = s->attn_out;
+    iris_cuda_tensor_t concat_gpu = s->concat;
+    iris_cuda_tensor_t proj_out_gpu = s->proj_out;
+
+    /* Phase 3: AdaLN norm */
+    if (!iris_cuda_adaln_norm(norm_gpu, hidden_gpu, shift, scale, seq, h_size, eps))
+        goto cuda_fallback;
+
+    /* Phase 4: Fused QKV+MLP projection */
+    if (block->qkv_mlp_weight_bf16) {
+        if (!iris_cuda_linear_bf16_into(fused_result, norm_gpu,
+                                         block->qkv_mlp_weight_bf16,
+                                         seq, h_size, fused_dim))
+            goto cuda_fallback;
+    } else if (block->qkv_mlp_weight) {
+        if (!iris_cuda_linear_into(fused_result, norm_gpu,
+                                    block->qkv_mlp_weight, NULL,
+                                    seq, h_size, fused_dim))
+            goto cuda_fallback;
+    } else {
+        goto cuda_fallback;
+    }
+
+    /* Phase 5: Split Q, K, V, gate, up */
+    if (!iris_cuda_split_qkv_mlp(fused_result, q_gpu, k_gpu, v_gpu, gate_gpu, up_gpu,
+                                  seq, h_size, mlp_hidden))
+        goto cuda_fallback;
+
+    /* Phase 6: QK RMSNorm */
+    if (!iris_cuda_qk_rms_norm(q_gpu, k_gpu,
+                                block->norm_q_weight, block->norm_k_weight,
+                                seq, heads, head_dim, eps))
+        goto cuda_fallback;
+
+    /* Phase 7: RoPE 2D */
+    {
+        /* Compute per-position RoPE frequencies on CPU, upload to GPU */
+        int freq_count = seq * axis_dim;
+        float *cos_vals = (float *)malloc(freq_count * sizeof(float));
+        float *sin_vals = (float *)malloc(freq_count * sizeof(float));
+        if (!cos_vals || !sin_vals) { free(cos_vals); free(sin_vals); goto cuda_fallback; }
+
+        for (int pos = 0; pos < seq; pos++) {
+            const float *c_src, *s_src;
+            if (pos < img_offset) {
+                c_src = txt_rope_cos + pos * axis_dim;
+                s_src = txt_rope_sin + pos * axis_dim;
+            } else {
+                int img_pos = pos - img_offset;
+                c_src = img_rope_cos + img_pos * axis_dim;
+                s_src = img_rope_sin + img_pos * axis_dim;
+            }
+            memcpy(cos_vals + pos * axis_dim, c_src, axis_dim * sizeof(float));
+            memcpy(sin_vals + pos * axis_dim, s_src, axis_dim * sizeof(float));
+        }
+
+        int ok = iris_cuda_rope_2d(q_gpu, k_gpu, cos_vals, sin_vals,
+                                    seq, heads, head_dim);
+        free(cos_vals);
+        free(sin_vals);
+        if (!ok) goto cuda_fallback;
+    }
+
+    /* Phase 8: Attention */
+    if (!iris_cuda_attention(attn_out_gpu, q_gpu, k_gpu, v_gpu,
+                              seq, heads, head_dim, attn_scale))
+        goto cuda_fallback;
+
+    /* Phase 9: SiLU(gate) * up (SwiGLU) */
+    if (!iris_cuda_silu_mul(gate_gpu, up_gpu, seq * mlp_hidden))
+        goto cuda_fallback;
+
+    /* Phase 10: Concat attention and MLP outputs */
+    if (!iris_cuda_concat_attn_mlp(attn_out_gpu, gate_gpu, concat_gpu,
+                                    seq, h_size, mlp_hidden))
+        goto cuda_fallback;
+
+    /* Phase 11: Output projection */
+    if (block->proj_mlp_weight_bf16) {
+        if (!iris_cuda_linear_bf16_into(proj_out_gpu, concat_gpu,
+                                         block->proj_mlp_weight_bf16,
+                                         seq, h_size + mlp_hidden, h_size))
+            goto cuda_fallback;
+    } else if (block->proj_mlp_weight) {
+        if (!iris_cuda_linear_into(proj_out_gpu, concat_gpu,
+                                    block->proj_mlp_weight, NULL,
+                                    seq, h_size + mlp_hidden, h_size))
+            goto cuda_fallback;
+    } else {
+        goto cuda_fallback;
+    }
+
+    /* Phase 12: Gated residual add */
+    if (!iris_cuda_gated_add(hidden_gpu, proj_out_gpu, gate, seq, h_size))
+        goto cuda_fallback;
+
+    if (own_tensors) {
+        single_block_cuda_scratch_free(s);
+    }
+    return 1;
+
+cuda_fallback:
+    if (own_tensors) {
+        single_block_cuda_scratch_free(s);
+    }
+    return 0;
+}
+
+#endif /* USE_CUDA */
+
+#ifdef USE_METAL
+
+/* ========================================================================
  * BF16 Native Single Block Forward
  *
  * This function processes a single block entirely in bf16. All intermediate
@@ -3693,10 +3922,10 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
 
-#ifdef USE_METAL
-    /* Try BF16 native path first */
+    /* Flags shared by Metal and CUDA GPU chained paths */
     int bf16_path_ok = 0;
     int gpu_chained_ok = 0;
+#ifdef USE_METAL
     iris_gpu_tensor_t concat_hidden_gpu = NULL;
 
     /* BF16 native single block path - currently disabled.
@@ -3864,10 +4093,64 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             concat_hidden_gpu = NULL;
         }
     }
-
-    /* Fall back to per-block GPU/CPU path if both bf16 and f32 chained paths failed */
-    if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
+
+    /* CUDA f32 chained path */
+#ifdef USE_CUDA
+    if (!bf16_path_ok && !gpu_chained_ok && iris_cuda_available() && !tf->use_mmap) {
+        iris_cuda_tensor_t concat_hidden_cuda = iris_cuda_tensor_create(concat_hidden, total_seq * hidden);
+        if (concat_hidden_cuda) {
+            int cuda_chained_ok = 1;
+
+            /* Pre-compute AdaLN modulation ONCE for all single blocks */
+            int mod_size = hidden * 3;
+            for (int j = 0; j < hidden; j++) {
+                float x = t_emb[j];
+                tf->t_emb_silu[j] = x / (1.0f + expf(-x));
+            }
+            int fused_dim = hidden * 3 + tf->mlp_hidden * 2;
+            float *mod_params = tf->work2 + total_seq * fused_dim;
+            iris_linear_nobias(mod_params, tf->t_emb_silu, tf->adaln_single_weight, 1, hidden, mod_size);
+            float *precomputed_shift = mod_params;
+            float *precomputed_scale = mod_params + hidden;
+            float *precomputed_gate = mod_params + hidden * 2;
+
+            /* Start CUDA batch mode — no sync between blocks */
+            iris_cuda_begin_batch();
+
+            single_block_cuda_scratch_t cuda_scratch;
+            int scratch_ok = single_block_cuda_scratch_init(&cuda_scratch, total_seq, hidden, tf->mlp_hidden);
+
+            for (int i = 0; i < tf->num_single_layers && cuda_chained_ok; i++) {
+                if (!single_block_forward_cuda_chained(concat_hidden_cuda, &tf->single_blocks[i],
+                                                        precomputed_shift, precomputed_scale, precomputed_gate,
+                                                        img_rope_cos, img_rope_sin,
+                                                        txt_rope_cos, txt_rope_sin,
+                                                        total_seq, txt_seq, tf,
+                                                        scratch_ok ? &cuda_scratch : NULL)) {
+                    cuda_chained_ok = 0;
+                    iris_cuda_end_batch();
+                    iris_cuda_tensor_read(concat_hidden_cuda, concat_hidden);
+                }
+                if (iris_substep_callback)
+                    iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
+            }
+
+            if (scratch_ok) single_block_cuda_scratch_free(&cuda_scratch);
+
+            if (cuda_chained_ok) {
+                iris_cuda_end_batch();
+                iris_cuda_tensor_read(concat_hidden_cuda, concat_hidden);
+                gpu_chained_ok = 1;
+            }
+
+            iris_cuda_tensor_free(concat_hidden_cuda);
+        }
+    }
+#endif
+
+    /* Fall back to per-block GPU/CPU path if both GPU chained paths failed */
+    if (!bf16_path_ok && !gpu_chained_ok) {
         for (int i = 0; i < tf->num_single_layers; i++) {
             /* In mmap mode, load block weights on-demand and free after use */
             if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
@@ -3905,9 +4188,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             }
 #endif
         }
-#ifdef USE_METAL
     }
-#endif
 
     double single_time = tf_get_time_ms() - single_start;
 

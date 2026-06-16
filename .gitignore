@@ -42,10 +42,13 @@ documents/
 build/
 build_generic/
 build-test/
+build_cuda/
 
 # Generated test images (root level only, keep images/ and test_vectors/)
 /test_*.png
 /test_*.jpg
+/cuda_*.png
+/ref_*.png
 
 # Python cache / virtual environments
 __pycache__/

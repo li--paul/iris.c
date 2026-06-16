@@ -6,6 +6,7 @@ project(iris C)
 # ==============================================================================
 option(USE_BLAS  "Enable BLAS acceleration (OpenBLAS / Accelerate / MKL)" OFF)
 option(USE_METAL "Enable Metal GPU on Apple Silicon (macOS only)"          OFF)
+option(USE_CUDA  "Enable CUDA GPU acceleration (NVIDIA, Windows/Linux)"    OFF)
 
 # ==============================================================================
 # C standard
@@ -172,6 +173,73 @@ else()
 endif()
 
 # ==============================================================================
+# CUDA backend (NVIDIA GPU, Windows/Linux)
+# ==============================================================================
+if(USE_CUDA)
+  # Find CUDA toolkit (for cuda_runtime.h, cublas_v2.h, and nvcc)
+  find_package(CUDAToolkit REQUIRED)
+  find_program(IRIS_NVCC nvcc
+    PATHS "${CUDAToolkit_BIN_DIR}" NO_DEFAULT_PATH)
+  if(NOT IRIS_NVCC)
+    message(FATAL_ERROR "nvcc not found in CUDA toolkit at ${CUDAToolkit_BIN_DIR}")
+  endif()
+
+  set(IRIS_CUDA_ARCHS "75;80;89")
+  set(IRIS_CUDA_ARCH_FLAGS)
+  foreach(arch ${IRIS_CUDA_ARCHS})
+    list(APPEND IRIS_CUDA_ARCH_FLAGS
+      --generate-code=arch=compute_${arch},code=[compute_${arch},sm_${arch}])
+  endforeach()
+
+  # Collect include dirs and defines from the iris target for NVCC
+  set(IRIS_CUDA_INCLUDES
+    -I"${CMAKE_CURRENT_SOURCE_DIR}"
+    -I"${CUDAToolkit_INCLUDE_DIRS}"
+  )
+  if(DEFINED MKL_INCLUDE)
+    list(APPEND IRIS_CUDA_INCLUDES -I"${MKL_INCLUDE}")
+  endif()
+
+  set(IRIS_CUDA_DEFINES
+    -DUSE_CUDA -DUSE_BLAS -DUSE_MKL
+    -D_CRT_SECURE_NO_WARNINGS -D_USE_MATH_DEFINES -DWIN32
+  )
+
+  # NVCC host compiler flags — lists expand to multiple args in add_custom_command
+  set(IRIS_CUDA_HOST_FLAGS -Xcompiler=/MD -Xcompiler=/O2)
+
+  # Build the object file with nvcc directly, bypassing CMake CUDA integration
+  # (avoid conflicts between CMake 4.x and CUDA 13.0 for -Xcompiler / -ccbin flags)
+  set(IRIS_CUDA_OBJ "${CMAKE_CURRENT_BINARY_DIR}/iris_cuda.obj")
+  add_custom_command(
+    OUTPUT ${IRIS_CUDA_OBJ}
+    COMMAND ${IRIS_NVCC}
+      -ccbin "${CMAKE_C_COMPILER}"
+      ${IRIS_CUDA_INCLUDES}
+      --machine 64 --compile -cudart static
+      ${IRIS_CUDA_ARCH_FLAGS}
+      ${IRIS_CUDA_DEFINES}
+      ${IRIS_CUDA_HOST_FLAGS}
+      -o ${IRIS_CUDA_OBJ}
+      "${CMAKE_CURRENT_SOURCE_DIR}/iris_cuda.cu"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/iris_cuda.cu"
+    COMMENT "Compiling CUDA kernel (iris_cuda.cu → iris_cuda.obj)"
+  )
+
+  # Import the object file as a generated source
+  target_sources(iris PRIVATE ${IRIS_CUDA_OBJ})
+  set_source_files_properties(${IRIS_CUDA_OBJ} PROPERTIES GENERATED TRUE)
+
+  target_include_directories(iris PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(iris PRIVATE CUDA::cudart CUDA::cublas)
+  target_compile_definitions(iris PRIVATE USE_CUDA)
+
+  message(STATUS "CUDA GPU: enabled (${CUDAToolkit_VERSION}, arch=${IRIS_CUDA_ARCHS})")
+else()
+  message(STATUS "CUDA GPU: disabled")
+endif()
+
+# ==============================================================================
 # Static library
 # ==============================================================================
 add_library(libiris STATIC ${IRIS_SOURCES})
@@ -181,6 +249,12 @@ if(NOT WIN32)
 endif()
 if(APPLE)
   target_compile_definitions(libiris PRIVATE ACCELERATE_NEW_LAPACK)
+endif()
+if(USE_CUDA)
+  target_include_directories(libiris PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(libiris PRIVATE CUDA::cudart CUDA::cublas)
+  set_property(TARGET libiris PROPERTY CUDA_ARCHITECTURES "${IRIS_CUDA_ARCHS}")
+  target_compile_definitions(libiris PRIVATE USE_CUDA)
 endif()
 
 # ==============================================================================

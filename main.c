@@ -37,6 +37,9 @@
 #ifdef USE_METAL
 #include "iris_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "iris_cuda.h"
+#endif
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -276,6 +279,9 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef USE_METAL
     iris_metal_init();
+#endif
+#ifdef USE_CUDA
+    iris_cuda_init();
 #endif
 
     /* Command line options */

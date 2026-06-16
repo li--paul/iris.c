@@ -18,6 +18,9 @@
 #ifdef USE_METAL
 #include "iris_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "iris_cuda.h"
+#endif
 
 /* ========================================================================
  * Forward Declarations for Internal Types

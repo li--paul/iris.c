@@ -1,26 +1,40 @@
-# Test script for Iris on Windows/MSVC with oneMKL
+# Test script for Iris on Windows/MSVC
 # Run from the iris.c project root directory
 # IMPORTANT: Avoid 2>&1 in PowerShell — it corrupts ANSI stderr output
+# Use environment variable IRIS_BUILD_DIR to select CUDA build: $env:IRIS_BUILD_DIR = "build_cuda"
 
 $ErrorActionPreference = "Stop"
 $ModelDir = "flux-klein-4b"
+$BuildDir = if ($env:IRIS_BUILD_DIR) { $env:IRIS_BUILD_DIR } else { "build" }
+
+# PATH setup for MKL DLLs (required at runtime)
 $MklBinDir = "C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin"
-$CompilerBinDir = "C:\Program Files (x86)\Intel\oneAPI\compiler\2025.0\bin"
+$MklCompilerBin = "C:\Program Files (x86)\Intel\oneAPI\2025.0\bin"
+$env:PATH = "${MklBinDir};${MklCompilerBin};" + $env:PATH
+
+# CUDA DLL path (if CUDA build)
+$CudaBinDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
+if (Test-Path $CudaBinDir) {
+    $env:PATH = "${CudaBinDir};" + $env:PATH
+}
 
 if (-not (Test-Path $MklBinDir)) { Write-Error "MKL not found at $MklBinDir"; exit 1 }
-if (-not (Test-Path $CompilerBinDir)) { Write-Error "Intel compiler bin not found at $CompilerBinDir"; exit 1 }
 
-# --- Build ---
-Write-Host "=== Configuring CMake (MKL LP64) ===" -ForegroundColor Cyan
-cmake -B build -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64 | Out-Null
-if (-not $?) { exit 1 }
+# --- Build (skip if build dir exists and user sets SKIP_BUILD) ---
+if (-not $env:SKIP_BUILD) {
+    Write-Host "=== Configuring CMake (${BuildDir}) ===" -ForegroundColor Cyan
+    cmake -B $BuildDir -DUSE_BLAS=ON -DMKL_INTERFACE_FULL=intel_lp64 | Out-Null
+    if (-not $?) { exit 1 }
 
-Write-Host "=== Building Release ===" -ForegroundColor Cyan
-cmake --build build --config Release --target iris | Out-Null
-if (-not $?) { exit 1 }
+    Write-Host "=== Building Release ===" -ForegroundColor Cyan
+    cmake --build $BuildDir --config Release --target iris | Out-Null
+    if (-not $?) { exit 1 }
+} else {
+    Write-Host "=== Skipping build (SKIP_BUILD set) ===" -ForegroundColor Yellow
+}
 
-$env:PATH = "${MklBinDir};${CompilerBinDir};" + $env:PATH
-$Iris = ".\build\Release\iris.exe"
+$Iris = ".\${BuildDir}\Release\iris.exe"
+if (-not (Test-Path $Iris)) { Write-Error "Not found: $Iris"; exit 1 }
 
 # --- Test 1: --help ---
 Write-Host "`n=== Test 1: --help ===" -ForegroundColor Cyan
@@ -67,4 +81,4 @@ if (Test-Path "test_cat.png") {
 }
 
 Write-Host "`n=== All tests passed! ===" -ForegroundColor Cyan
-Write-Host "Generated: test_cat.png (256x256, 4 steps, 197KB)" -ForegroundColor Yellow
+Write-Host "Generated: test_cat.png (256x256, 4 steps, ~197KB)" -ForegroundColor Yellow
